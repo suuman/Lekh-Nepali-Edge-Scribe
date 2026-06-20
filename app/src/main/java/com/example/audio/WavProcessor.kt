@@ -4,7 +4,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 object WavProcessor {
-    fun processWav(rawBytes: ByteArray): List<ByteArray>? {
+    fun processWav(rawBytes: ByteArray): ByteArray? {
         try {
             if (rawBytes.size < 44) return null
             
@@ -112,74 +112,67 @@ object WavProcessor {
         currentPcm = newPcm
     }
     
-        if (currentPcm.size % 2 != 0) {
-            currentPcm = currentPcm.copyOf(currentPcm.size - 1)
-        }
-        
-        val maxSamples = 29 * 16000
-        val maxBytesPerChunk = maxSamples * 2
-        val chunks = mutableListOf<ByteArray>()
-        
-        var offset = 0
-        while (offset < currentPcm.size) {
-            val end = minOf(offset + maxBytesPerChunk, currentPcm.size)
-            val pcmChunk = currentPcm.copyOfRange(offset, end)
-            
-            val pcmDataSize = pcmChunk.size
-            val wavFileSize = pcmDataSize + 36 // 36 is the rest of the header
-            val byteRate = 16000 * 1 * 2
-            
-            val header = ByteArray(44)
-            header[0] = 'R'.code.toByte()
-            header[1] = 'I'.code.toByte()
-            header[2] = 'F'.code.toByte()
-            header[3] = 'F'.code.toByte()
-            header[4] = (wavFileSize and 0xff).toByte()
-            header[5] = (wavFileSize shr 8 and 0xff).toByte()
-            header[6] = (wavFileSize shr 16 and 0xff).toByte()
-            header[7] = (wavFileSize shr 24 and 0xff).toByte()
-            header[8] = 'W'.code.toByte()
-            header[9] = 'A'.code.toByte()
-            header[10] = 'V'.code.toByte()
-            header[11] = 'E'.code.toByte()
-            header[12] = 'f'.code.toByte()
-            header[13] = 'm'.code.toByte()
-            header[14] = 't'.code.toByte()
-            header[15] = ' '.code.toByte()
-            header[16] = 16
-            header[17] = 0
-            header[18] = 0
-            header[19] = 0
-            header[20] = 1
-            header[21] = 0
-            header[22] = 1 // Channels
-            header[23] = 0
-            header[24] = (16000 and 0xff).toByte() // sample rate
-            header[25] = (16000 shr 8 and 0xff).toByte()
-            header[26] = (16000 shr 16 and 0xff).toByte()
-            header[27] = (16000 shr 24 and 0xff).toByte()
-            header[28] = (byteRate and 0xff).toByte() // byte rate
-            header[29] = (byteRate shr 8 and 0xff).toByte()
-            header[30] = (byteRate shr 16 and 0xff).toByte()
-            header[31] = (byteRate shr 24 and 0xff).toByte()
-            header[32] = 2 // block align
-            header[33] = 0
-            header[34] = 16 // bits per sample
-            header[35] = 0
-            header[36] = 'd'.code.toByte()
-            header[37] = 'a'.code.toByte()
-            header[38] = 't'.code.toByte()
-            header[39] = 'a'.code.toByte()
-            header[40] = (pcmDataSize and 0xff).toByte()
-            header[41] = (pcmDataSize shr 8 and 0xff).toByte()
-            header[42] = (pcmDataSize shr 16 and 0xff).toByte()
-            header[43] = (pcmDataSize shr 24 and 0xff).toByte()
-            
-            chunks.add(header + pcmChunk)
-            offset += maxBytesPerChunk
-        }
-        
-        return chunks
+    // Trim to max 30 seconds
+    val maxSamples = 30 * 16000
+    if (currentPcm.size > maxSamples * 2) {
+        currentPcm = currentPcm.copyOfRange(0, maxSamples * 2)
+    }
+    
+    // Add WAV Header
+    if (currentPcm.size % 2 != 0) {
+        currentPcm = currentPcm.copyOf(currentPcm.size - 1)
+    }
+    val header = ByteArray(44)
+    val pcmDataSize = currentPcm.size
+    val wavFileSize = pcmDataSize + 44 // 44 bytes for the header
+    val byteRate = 16000 * 1 * 2
+
+    header[0] = 'R'.code.toByte()
+    header[1] = 'I'.code.toByte()
+    header[2] = 'F'.code.toByte()
+    header[3] = 'F'.code.toByte()
+    header[4] = (wavFileSize and 0xff).toByte()
+    header[5] = (wavFileSize shr 8 and 0xff).toByte()
+    header[6] = (wavFileSize shr 16 and 0xff).toByte()
+    header[7] = (wavFileSize shr 24 and 0xff).toByte()
+    header[8] = 'W'.code.toByte()
+    header[9] = 'A'.code.toByte()
+    header[10] = 'V'.code.toByte()
+    header[11] = 'E'.code.toByte()
+    header[12] = 'f'.code.toByte()
+    header[13] = 'm'.code.toByte()
+    header[14] = 't'.code.toByte()
+    header[15] = ' '.code.toByte()
+    header[16] = 16
+    header[17] = 0
+    header[18] = 0
+    header[19] = 0
+    header[20] = 1
+    header[21] = 0
+    header[22] = 1 // Channels
+    header[23] = 0
+    header[24] = (16000 and 0xff).toByte() // sample rate
+    header[25] = (16000 shr 8 and 0xff).toByte()
+    header[26] = (16000 shr 16 and 0xff).toByte()
+    header[27] = (16000 shr 24 and 0xff).toByte()
+    header[28] = (byteRate and 0xff).toByte() // byte rate
+    header[29] = (byteRate shr 8 and 0xff).toByte()
+    header[30] = (byteRate shr 16 and 0xff).toByte()
+    header[31] = (byteRate shr 24 and 0xff).toByte()
+    header[32] = 2 // block align
+    header[33] = 0
+    header[34] = 16 // bits per sample
+    header[35] = 0
+    header[36] = 'd'.code.toByte()
+    header[37] = 'a'.code.toByte()
+    header[38] = 't'.code.toByte()
+    header[39] = 'a'.code.toByte()
+    header[40] = (pcmDataSize and 0xff).toByte()
+    header[41] = (pcmDataSize shr 8 and 0xff).toByte()
+    header[42] = (pcmDataSize shr 16 and 0xff).toByte()
+    header[43] = (pcmDataSize shr 24 and 0xff).toByte()
+
+    return header + currentPcm
         } catch (e: Throwable) {
             return null
         }

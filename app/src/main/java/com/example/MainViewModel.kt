@@ -106,22 +106,15 @@ class MainViewModel(
             loadModel(savedPath)
         }
         
+        // Listen for successful transcription to save in local Room Database
         viewModelScope.launch {
             transcribeState.collect { state ->
-                if (state is AudioTranscribeEngine.State.Success) {
-                    if (state.fromFile) {
-                        saveTranscriptionToDatabase(
-                            fileName = _selectedAudioName.value ?: "Selected Audio File",
-                            text = state.text,
-                            fromFile = true
-                        )
-                    } else {
-                        saveTranscriptionToDatabase(
-                            fileName = "Microphone Live Speech",
-                            text = state.text,
-                            fromFile = false
-                        )
-                    }
+                if (state is AudioTranscribeEngine.State.Success && state.fromFile) {
+                    saveTranscriptionToDatabase(
+                        fileName = _selectedAudioName.value ?: "Selected Audio File",
+                        text = state.text,
+                        fromFile = true
+                    )
                 }
             }
         }
@@ -314,7 +307,19 @@ class MainViewModel(
     }
 
     fun stopListeningAndSave() {
-        transcribeEngine?.stopListening(_isStrictTranscription.value)
+        transcribeEngine?.stopListening()
+        viewModelScope.launch {
+            // Wait slightly for final results update
+            delay(500)
+            val currentState = transcribeState.value
+            if (currentState is AudioTranscribeEngine.State.Success) {
+                saveTranscriptionToDatabase(
+                    fileName = "Microphone Live Speech",
+                    text = currentState.text,
+                    fromFile = false
+                )
+            }
+        }
     }
 
     fun transcribeFile() {
