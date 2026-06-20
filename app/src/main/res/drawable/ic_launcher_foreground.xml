@@ -1,0 +1,51 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Background glowing soundwaves -->
+    <path
+        android:fillColor="#80FFFFFF"
+        android:pathData="M34,54 A20,20 0 0,1 74,54"
+        android:strokeWidth="3"
+        android:strokeColor="#B3FFFFFF"
+        android:strokeLineCap="round"/>
+    <path
+        android:fillColor="#40FFFFFF"
+        android:pathData="M24,54 A30,30 0 0,1 84,54"
+        android:strokeWidth="3.5"
+        android:strokeColor="#66FFFFFF"
+        android:strokeLineCap="round"/>
+
+    <!-- Central Microphone Body -->
+    <!-- Mic Dome/Cap -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M44,30 H64 V56 A10,10 0 0,1 44,56 Z" />
+    <!-- Mic stripe details -->
+    <path
+        android:fillColor="#E0E0E0"
+        android:pathData="M44,40 H64 V43 H44 Z" />
+    <path
+        android:fillColor="#E0E0E0"
+        android:pathData="M44,48 H64 V51 H44 Z" />
+
+    <!-- Mic U-shaped basket holder -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M38,46 V56 A16,16 0 0,0 70,56 V46"
+        android:strokeWidth="4"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"/>
+
+    <!-- Mic stand stem -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M52,72 H56 V84 H52 Z" />
+        
+    <!-- Mic base stand -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M40,84 H68 V88 H40 Z" />
+</vector>

@@ -1,0 +1,6 @@
+{
+  "name": "Nepalscribe",
+  "description": "Offline-first Nepali Audio Transcriber using local models with Google Edge AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
