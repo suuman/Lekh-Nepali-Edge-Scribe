@@ -229,13 +229,25 @@ class MainViewModel(
                     destDir.mkdirs()
                 }
                 val destFile = File(destDir, name)
-                
+
+                // Copy the main model file
                 context.contentResolver.openInputStream(uri)?.use { inputStream ->
                     destFile.outputStream().use { outputStream ->
                         inputStream.copyTo(outputStream)
                     }
                 }
-                
+
+                // Try to resolve the source directory and copy companion cache files.
+                // The Gemma 4 E2B model has companion files like:
+                //   model.litertlm.audio_adapter.xnnpack_cache_*
+                //   model.litertlm.static_audio_encoder.xnnpack_cache_*
+                //   model.litertlm.vision_adapter.xnnpack_cache_*
+                //   model.litertlm.vision_encoder_*
+                //   model.litertlm_*_mldrift_program_cache.bin
+                //   model.litertlm_*_mldrift_weight_cache.bin
+                // These MUST be in the same directory as the model for audio/vision to work.
+                copyCompanionFilesFromUri(uri, name, destDir)
+
                 launch(Dispatchers.Main) {
                     loadModel(destFile.absolutePath)
                 }
@@ -245,6 +257,104 @@ class MainViewModel(
                 }
             }
         }
+    }
+
+    /**
+     * Copy companion cache files that are siblings of the selected model file.
+     * Resolves the content URI to a real file path, then copies all sibling files
+     * that start with the same model filename (e.g., "model.litertlm.audio_adapter.*").
+     */
+    private fun copyCompanionFilesFromUri(modelUri: Uri, modelFileName: String, destDir: File) {
+        try {
+            // Try to resolve the content URI to a real filesystem path
+            val sourcePath = resolveUriToPath(modelUri)
+            if (sourcePath != null) {
+                val sourceFile = File(sourcePath)
+                val sourceDir = sourceFile.parentFile
+                if (sourceDir != null && sourceDir.isDirectory) {
+                    var copiedCount = 0
+                    sourceDir.listFiles()?.forEach { sibling ->
+                        // Copy files that start with the model filename but are not the model itself
+                        // e.g., "gemma-4-E2B-it.litertlm.audio_adapter.xnnpack_cache_..."
+                        if (sibling.name != modelFileName && sibling.name.startsWith(modelFileName)) {
+                            val destSibling = File(destDir, sibling.name)
+                            try {
+                                sibling.inputStream().use { input ->
+                                    destSibling.outputStream().use { output ->
+                                        input.copyTo(output)
+                                    }
+                                }
+                                copiedCount++
+                                Log.i("MainViewModel", "Copied companion file: ${sibling.name} (${sibling.length() / 1024}KB)")
+                            } catch (e: Exception) {
+                                Log.w("MainViewModel", "Failed to copy companion file ${sibling.name}: ${e.message}")
+                            }
+                        }
+                    }
+                    Log.i("MainViewModel", "Copied $copiedCount companion cache file(s) for audio/vision support")
+                    return
+                }
+            }
+            Log.w("MainViewModel", "Could not resolve source directory for companion files. " +
+                "Audio/vision features may not work. Use 'Load from path' for Gallery models.")
+        } catch (e: Exception) {
+            Log.w("MainViewModel", "Could not copy companion files: ${e.message}. " +
+                "Audio/vision features may not work.")
+        }
+    }
+
+    /**
+     * Try to resolve a content URI to a real filesystem path.
+     */
+    @Suppress("DEPRECATION")
+    private fun resolveUriToPath(uri: Uri): String? {
+        // Direct file URIs
+        if (uri.scheme == "file") return uri.path
+
+        // Content URIs - try MediaStore/document resolution
+        try {
+            context.contentResolver.query(uri, arrayOf(android.provider.MediaStore.MediaColumns.DATA),
+                null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DATA)
+                    if (idx >= 0) {
+                        val path = cursor.getString(idx)
+                        if (!path.isNullOrEmpty()) return path
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        // Try document URI path extraction
+        try {
+            val docId = android.provider.DocumentsContract.getDocumentId(uri)
+            if (docId != null && docId.contains(":")) {
+                val parts = docId.split(":")
+                if (parts.size == 2) {
+                    val type = parts[0]
+                    val relativePath = parts[1]
+                    if (type.equals("primary", ignoreCase = true)) {
+                        return android.os.Environment.getExternalStorageDirectory().absolutePath + "/" + relativePath
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        return null
+    }
+
+    /**
+     * Load a model directly from a filesystem path without copying.
+     * This is ideal for models stored by the Google AI Edge Gallery app,
+     * since all companion cache files are already in the same directory.
+     */
+    fun loadModelFromPath(path: String) {
+        val file = File(path)
+        if (!file.exists()) {
+            _modelState.value = ModelState.Error("File not found: $path")
+            return
+        }
+        loadModel(file.absolutePath)
     }
 
     fun loadModel(path: String) {

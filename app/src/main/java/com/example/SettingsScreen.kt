@@ -3,6 +3,7 @@ package com.example
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -183,6 +184,80 @@ fun SettingsScreen(
                         Icon(imageVector = Icons.Default.FolderOpen, contentDescription = "Folder")
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(text = "मोडेल फाइल लोड गर्नुहोस् (Load .litertlm / .bin)")
+                    }
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
+
+                    // Load from Gallery path section
+                    var manualPathInput by remember { mutableStateOf("") }
+                    var showPathInput by remember { mutableStateOf(false) }
+
+                    OutlinedButton(
+                        onClick = { showPathInput = !showPathInput },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(44.dp)
+                            .testTag("load_from_path_toggle"),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+                        )
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AppShortcut,
+                            contentDescription = "Gallery",
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "AI Edge Gallery बाट लोड गर्नुहोस् (Load from Gallery)",
+                            fontSize = 13.sp
+                        )
+                    }
+
+                    if (showPathInput) {
+                        Text(
+                            text = "Google AI Edge Gallery ले भण्डारण गरेको मोडेल फाइलको पूरा पथ लेख्नुहोस्। " +
+                                "यसले सबै अडियो/भिजन क्यास फाइलहरू स्वचालित रूपमा भेट्टाउँछ।",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 11.sp
+                        )
+
+                        OutlinedTextField(
+                            value = manualPathInput,
+                            onValueChange = { manualPathInput = it },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("model_path_input"),
+                            label = { Text("मोडेल फाइल पथ (Full path to .litertlm)", fontSize = 12.sp) },
+                            placeholder = { Text("/storage/emulated/0/Android/data/com.google.ai.edge.gallery/files/.../gemma-4-E2B-it.litertlm", fontSize = 10.sp) },
+                            textStyle = MaterialTheme.typography.bodySmall,
+                            shape = RoundedCornerShape(12.dp),
+                            singleLine = true
+                        )
+
+                        Button(
+                            onClick = {
+                                if (manualPathInput.trim().isNotEmpty()) {
+                                    viewModel.loadModelFromPath(manualPathInput.trim())
+                                }
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(44.dp)
+                                .testTag("load_from_path_button"),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.tertiary
+                            ),
+                            enabled = manualPathInput.trim().isNotEmpty()
+                        ) {
+                            Icon(imageVector = Icons.Default.PlayArrow, contentDescription = "Load")
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("यो पथबाट लोड गर्नुहोस् (Load from this path)")
+                        }
                     }
                 }
             }

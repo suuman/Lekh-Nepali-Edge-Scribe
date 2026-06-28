@@ -50,6 +50,10 @@ class LlmChatModelHelper(private val context: Context) {
         }
     }
 
+    fun resetConversation() {
+        llmWrapper?.resetConversation()
+    }
+
     fun close() {
         try {
             llmWrapper?.close()
