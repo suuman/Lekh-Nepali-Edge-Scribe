@@ -23,7 +23,8 @@ object AudioDecoder {
     private const val TARGET_CHANNELS = 1
     private const val TARGET_BITS = 16
     private const val CODEC_TIMEOUT_US = 10_000L // 10ms
-    private const val MAX_DURATION_SECONDS = 30
+    // Memory bound only — long files are chunked into 30s pieces downstream
+    private const val MAX_DURATION_SECONDS = 600
 
     /**
      * Result of decoding, containing normalized PCM data and metadata.
@@ -141,6 +142,11 @@ object AudioDecoder {
             var inputDone = false
             var outputDone = false
 
+            // The decoder's actual output format can differ from the container's
+            // declared format (e.g. HE-AAC/SBR doubles the sample rate). Track it.
+            var outputSampleRate = sourceSampleRate
+            var outputChannels = sourceChannels
+
             // Max PCM samples to produce (30 seconds at source rate, before resampling)
             val maxSourceSamples = MAX_DURATION_SECONDS.toLong() * sourceSampleRate * sourceChannels * 2 // 16-bit = 2 bytes
             var totalPcmBytes = 0L
@@ -196,17 +202,24 @@ object AudioDecoder {
                     }
                     outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         val newFormat = codec.outputFormat
-                        Log.i(TAG, "Output format changed: $newFormat")
+                        if (newFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                            outputSampleRate = newFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        }
+                        if (newFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                            outputChannels = newFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                        }
+                        Log.i(TAG, "Output format changed: rate=$outputSampleRate, channels=$outputChannels ($newFormat)")
                     }
                     // INFO_TRY_AGAIN_LATER — just loop
                 }
             }
 
             val rawPcm = pcmOutputStream.toByteArray()
-            Log.i(TAG, "Decoded ${rawPcm.size} bytes of raw PCM (source: ${sourceSampleRate}Hz, ${sourceChannels}ch)")
+            Log.i(TAG, "Decoded ${rawPcm.size} bytes of raw PCM (output: ${outputSampleRate}Hz, ${outputChannels}ch)")
 
-            // Normalize: convert to mono + resample to 16kHz
-            val normalizedPcm = normalizePcm(rawPcm, sourceSampleRate, sourceChannels)
+            // Normalize: convert to mono + resample to 16kHz, using the codec's
+            // ACTUAL output format, not the container's declared one
+            val normalizedPcm = normalizePcm(rawPcm, outputSampleRate, outputChannels)
             val durationMs = if (durationUs > 0) durationUs / 1000 else
                 (normalizedPcm.size.toLong() * 1000) / (TARGET_SAMPLE_RATE * 2)
 
@@ -281,19 +294,29 @@ object AudioDecoder {
             current = mono
         }
 
-        // Step 2: Resample to 16kHz if needed
-        if (sampleRate != TARGET_SAMPLE_RATE && sampleRate in 100..192000) {
+        // Step 2: Resample to 16kHz if needed (linear interpolation)
+        if (sampleRate != TARGET_SAMPLE_RATE && sampleRate in 4000..192000) {
             val ratio = sampleRate.toDouble() / TARGET_SAMPLE_RATE.toDouble()
             val numSamplesIn = current.size / 2
-            val numSamplesOut = (numSamplesIn / ratio).toInt()
-            val resampled = ByteArray(numSamplesOut * 2)
+            if (numSamplesIn > 0) {
+                val numSamplesOut = (numSamplesIn / ratio).toInt().coerceAtLeast(1)
+                val resampled = ByteArray(numSamplesOut * 2)
 
-            for (i in 0 until numSamplesOut) {
-                val srcIdx = (i * ratio).toInt().coerceAtMost(numSamplesIn - 1)
-                resampled[i * 2] = current[srcIdx * 2]
-                resampled[i * 2 + 1] = current[srcIdx * 2 + 1]
+                for (i in 0 until numSamplesOut) {
+                    val srcPos = i * ratio
+                    val idx = srcPos.toInt().coerceAtMost(numSamplesIn - 1)
+                    val nextIdx = (idx + 1).coerceAtMost(numSamplesIn - 1)
+                    val frac = srcPos - idx
+
+                    val s0 = ((current[idx * 2 + 1].toInt() shl 8) or (current[idx * 2].toInt() and 0xFF))
+                    val s1 = ((current[nextIdx * 2 + 1].toInt() shl 8) or (current[nextIdx * 2].toInt() and 0xFF))
+                    val sample = (s0 + (s1 - s0) * frac).toInt().coerceIn(-32768, 32767)
+
+                    resampled[i * 2] = (sample and 0xFF).toByte()
+                    resampled[i * 2 + 1] = ((sample shr 8) and 0xFF).toByte()
+                }
+                current = resampled
             }
-            current = resampled
         }
 
         // Step 3: Trim to max duration

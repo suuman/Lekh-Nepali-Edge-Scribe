@@ -463,8 +463,8 @@ class MainViewModel(
             launch(Dispatchers.Main) {
                 if (result != null) {
                     result.fold(
-                        onSuccess = { file ->
-                            onResult("Successfully exported text to: ${file.absolutePath}")
+                        onSuccess = { path ->
+                            onResult("Successfully exported text to: $path")
                         },
                         onFailure = {
                             onResult("Failed to export text: ${it.localizedMessage}")

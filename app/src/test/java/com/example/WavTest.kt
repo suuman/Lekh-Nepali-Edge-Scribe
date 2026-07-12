@@ -65,9 +65,44 @@ class WavTest {
         val output = WavProcessor.processWav(input)
         println("Input size: " + input.size)
         println("Output size: " + (output?.size ?: -1))
-        
-        if (output != null) {
-            println("Output Header: " + output.take(44).map { it.toUByte().toString(16).padStart(2, '0').uppercase() }.joinToString(" "))
+
+        // Already 16kHz/mono/16-bit: output is the raw PCM unchanged, no header
+        org.junit.Assert.assertNotNull(output)
+        org.junit.Assert.assertEquals(pcm.size, output!!.size)
+    }
+
+    @Test
+    fun testWavResampleStereo() {
+        // 1 second of 44.1kHz stereo 16-bit → should become 1 second of 16kHz mono
+        val sampleRate = 44100
+        val channels = 2
+        val frames = sampleRate // 1 second
+        val pcm = ByteArray(frames * channels * 2)
+        // Fill with a constant value so downmix output is predictable
+        for (i in 0 until frames * channels) {
+            pcm[i * 2] = 0x10
+            pcm[i * 2 + 1] = 0x00
         }
+        val input = buildWavHeader(sampleRate, channels, 16, pcm.size) + pcm
+        val output = WavProcessor.processWav(input)
+
+        org.junit.Assert.assertNotNull(output)
+        val outSamples = output!!.size / 2
+        // ~16000 samples of mono output (allow small rounding slack)
+        org.junit.Assert.assertTrue("got $outSamples samples", outSamples in 15990..16010)
+        // Constant input must survive downmix + interpolation unchanged
+        org.junit.Assert.assertEquals(0x10, output[0].toInt() and 0xFF)
+        org.junit.Assert.assertEquals(0x00, output[1].toInt())
+    }
+
+    private fun buildWavHeader(sampleRate: Int, channels: Int, bits: Int, dataSize: Int): ByteArray {
+        val byteRate = sampleRate * channels * bits / 8
+        val blockAlign = channels * bits / 8
+        return java.nio.ByteBuffer.allocate(44).order(java.nio.ByteOrder.LITTLE_ENDIAN).apply {
+            put("RIFF".toByteArray()); putInt(dataSize + 36); put("WAVE".toByteArray())
+            put("fmt ".toByteArray()); putInt(16); putShort(1); putShort(channels.toShort())
+            putInt(sampleRate); putInt(byteRate); putShort(blockAlign.toShort()); putShort(bits.toShort())
+            put("data".toByteArray()); putInt(dataSize)
+        }.array()
     }
 }

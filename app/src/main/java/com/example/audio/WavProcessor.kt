@@ -3,178 +3,183 @@ package com.example.audio
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
+/**
+ * Parses a WAV file and normalizes its audio data to raw 16kHz mono 16-bit PCM
+ * (no WAV header — callers wrap with [AudioDecoder.wrapInWavHeader] when needed).
+ *
+ * Supports PCM 8/16/24/32-bit integer, 32-bit float, and WAVE_FORMAT_EXTENSIBLE.
+ */
 object WavProcessor {
+
+    private const val TARGET_SAMPLE_RATE = 16000
+
+    private const val FORMAT_PCM = 1
+    private const val FORMAT_IEEE_FLOAT = 3
+    private const val FORMAT_EXTENSIBLE = 0xFFFE
+
+    /**
+     * @return raw 16kHz mono 16-bit little-endian PCM, or null if the input is not a valid WAV.
+     */
     fun processWav(rawBytes: ByteArray): ByteArray? {
         try {
             if (rawBytes.size < 44) return null
-            
+
             val buffer = ByteBuffer.wrap(rawBytes).order(ByteOrder.LITTLE_ENDIAN)
-        
-        val riffId = ByteArray(4)
-        buffer.get(riffId)
-        if (String(riffId) != "RIFF") return null
-        
-        buffer.position(8)
-        val waveId = ByteArray(4)
-        buffer.get(waveId)
-        if (String(waveId) != "WAVE") return null
-        
-        var channels = 1
-        var sampleRate = 16000
-        var bitsPerSample = 16
-        
-        buffer.position(12)
-        var dataOffset = -1
-        var dataSize = -1
-        
-        while (buffer.remaining() >= 8) {
-            val chunkIdBytes = ByteArray(4)
-            buffer.get(chunkIdBytes)
-            val chunkId = String(chunkIdBytes)
-            val chunkSize = buffer.int
-            
-            if (chunkId == "fmt ") {
-                buffer.short // audioFormat
-                channels = buffer.short.toInt()
-                sampleRate = buffer.int
-                buffer.int // byteRate
-                buffer.short // blockAlign
-                bitsPerSample = buffer.short.toInt()
-                if (chunkSize > 16) {
-                    val jump = (chunkSize - 16).coerceAtMost(buffer.remaining())
+
+            val riffId = ByteArray(4)
+            buffer.get(riffId)
+            if (String(riffId) != "RIFF") return null
+
+            buffer.position(8)
+            val waveId = ByteArray(4)
+            buffer.get(waveId)
+            if (String(waveId) != "WAVE") return null
+
+            var audioFormat = FORMAT_PCM
+            var channels = 1
+            var sampleRate = TARGET_SAMPLE_RATE
+            var bitsPerSample = 16
+
+            buffer.position(12)
+            var dataOffset = -1
+            var dataSize = -1
+
+            while (buffer.remaining() >= 8) {
+                val chunkIdBytes = ByteArray(4)
+                buffer.get(chunkIdBytes)
+                val chunkId = String(chunkIdBytes)
+                val chunkSize = buffer.int
+                if (chunkSize < 0) return null
+
+                if (chunkId == "fmt ") {
+                    if (buffer.remaining() < 16) return null
+                    audioFormat = buffer.short.toInt() and 0xFFFF
+                    channels = buffer.short.toInt()
+                    sampleRate = buffer.int
+                    buffer.int // byteRate
+                    buffer.short // blockAlign
+                    bitsPerSample = buffer.short.toInt()
+                    if (chunkSize > 16) {
+                        val jump = (chunkSize - 16).coerceAtMost(buffer.remaining())
+                        buffer.position(buffer.position() + jump)
+                    }
+                    // RIFF chunks are word-aligned: skip the pad byte after odd-sized chunks
+                    if (chunkSize % 2 != 0 && buffer.hasRemaining()) {
+                        buffer.position(buffer.position() + 1)
+                    }
+                } else if (chunkId == "data") {
+                    dataOffset = buffer.position()
+                    dataSize = chunkSize
+                    break
+                } else {
+                    val jump = (chunkSize + (chunkSize % 2)).coerceAtMost(buffer.remaining())
                     buffer.position(buffer.position() + jump)
                 }
-            } else if (chunkId == "data") {
-                dataOffset = buffer.position()
-                dataSize = chunkSize
-                break
+            }
+
+            if (dataOffset == -1 || channels < 1) return null
+            // For WAVE_FORMAT_EXTENSIBLE the actual format lives in the SubFormat GUID,
+            // but bitsPerSample is enough to pick the right integer/float decode path.
+            if (audioFormat != FORMAT_PCM &&
+                audioFormat != FORMAT_IEEE_FLOAT &&
+                audioFormat != FORMAT_EXTENSIBLE
+            ) {
+                return null
+            }
+
+            val actualDataSize = minOf(dataSize, rawBytes.size - dataOffset)
+            if (actualDataSize <= 0) return null
+            val pcmData = rawBytes.copyOfRange(dataOffset, dataOffset + actualDataSize)
+
+            // Decode samples to 16-bit signed, downmixing to mono in the same pass
+            val isFloat = audioFormat == FORMAT_IEEE_FLOAT ||
+                (audioFormat == FORMAT_EXTENSIBLE && bitsPerSample == 32 && looksLikeFloat(pcmData))
+            val monoSamples = toMono16(pcmData, channels, bitsPerSample, isFloat) ?: return null
+
+            // Resample to 16kHz with linear interpolation
+            val resampled = if (sampleRate != TARGET_SAMPLE_RATE && sampleRate in 4000..192000) {
+                resampleLinear(monoSamples, sampleRate, TARGET_SAMPLE_RATE)
             } else {
-                val jump = chunkSize.coerceAtMost(buffer.remaining())
-                buffer.position(buffer.position() + jump)
+                monoSamples
             }
-        }
-        
-        if (dataOffset == -1) return null
-        
-        val actualDataSize = minOf(dataSize, rawBytes.size - dataOffset)
-        val pcmData = rawBytes.copyOfRange(dataOffset, dataOffset + actualDataSize)
-        
-        // We need 16-bit mono 16000Hz PCM
-        var currentPcm = pcmData
-        
-        if (bitsPerSample == 8) {
-            // Convert to 16-bit
-            val newPcm = ByteArray(currentPcm.size * 2)
-            for (i in currentPcm.indices) {
-                // 8-bit WAV is unsigned, 16-bit is signed
-                val byteVal = currentPcm[i].toInt() and 0xFF
-                val shortVal = ((byteVal - 128) * 256).toShort()
-                newPcm[i * 2] = (shortVal.toInt() and 0xFF).toByte()
-                newPcm[i * 2 + 1] = ((shortVal.toInt() shr 8) and 0xFF).toByte()
-            }
-            currentPcm = newPcm
-            bitsPerSample = 16
-        }
-        
-        if (channels == 2) {
-            // Convert to mono
-            val newPcm = ByteArray(currentPcm.size / 2)
-            val shortsPerChannel = newPcm.size / 2
-            for (i in 0 until shortsPerChannel) {
-                val leftLsb = currentPcm[i * 4].toInt() and 0xFF
-                val leftMsb = currentPcm[i * 4 + 1].toInt()
-                val left = (leftMsb shl 8) or leftLsb
-                
-                val rightLsb = currentPcm[i * 4 + 2].toInt() and 0xFF
-                val rightMsb = currentPcm[i * 4 + 3].toInt()
-                val right = (rightMsb shl 8) or rightLsb
-                
-                val mix = (left + right) / 2
-                newPcm[i * 2] = (mix and 0xFF).toByte()
-                newPcm[i * 2 + 1] = ((mix shr 8) and 0xFF).toByte()
-            }
-            currentPcm = newPcm
-            channels = 1
-        }
-        
-        if (sampleRate in 100..192000 && sampleRate != 16000) {
-            // Nearest neighbor resample
-            val ratio = sampleRate.toDouble() / 16000.0
-            val numShortsIn = currentPcm.size / 2
-            val numShortsOut = (numShortsIn / ratio).toInt()
-        val newPcm = ByteArray(numShortsOut * 2)
-        
-        for (i in 0 until numShortsOut) {
-            val inIndex = (i * ratio).toInt().coerceAtMost(numShortsIn - 1)
-            newPcm[i * 2] = currentPcm[inIndex * 2]
-            newPcm[i * 2 + 1] = currentPcm[inIndex * 2 + 1]
-        }
-        currentPcm = newPcm
-    }
-    
-    // Trim to max 30 seconds
-    val maxSamples = 30 * 16000
-    if (currentPcm.size > maxSamples * 2) {
-        currentPcm = currentPcm.copyOfRange(0, maxSamples * 2)
-    }
-    
-    // Add WAV Header
-    if (currentPcm.size % 2 != 0) {
-        currentPcm = currentPcm.copyOf(currentPcm.size - 1)
-    }
-    val header = ByteArray(44)
-    val pcmDataSize = currentPcm.size
-    val wavFileSize = pcmDataSize + 44 // 44 bytes for the header
-    val byteRate = 16000 * 1 * 2
 
-    header[0] = 'R'.code.toByte()
-    header[1] = 'I'.code.toByte()
-    header[2] = 'F'.code.toByte()
-    header[3] = 'F'.code.toByte()
-    header[4] = (wavFileSize and 0xff).toByte()
-    header[5] = (wavFileSize shr 8 and 0xff).toByte()
-    header[6] = (wavFileSize shr 16 and 0xff).toByte()
-    header[7] = (wavFileSize shr 24 and 0xff).toByte()
-    header[8] = 'W'.code.toByte()
-    header[9] = 'A'.code.toByte()
-    header[10] = 'V'.code.toByte()
-    header[11] = 'E'.code.toByte()
-    header[12] = 'f'.code.toByte()
-    header[13] = 'm'.code.toByte()
-    header[14] = 't'.code.toByte()
-    header[15] = ' '.code.toByte()
-    header[16] = 16
-    header[17] = 0
-    header[18] = 0
-    header[19] = 0
-    header[20] = 1
-    header[21] = 0
-    header[22] = 1 // Channels
-    header[23] = 0
-    header[24] = (16000 and 0xff).toByte() // sample rate
-    header[25] = (16000 shr 8 and 0xff).toByte()
-    header[26] = (16000 shr 16 and 0xff).toByte()
-    header[27] = (16000 shr 24 and 0xff).toByte()
-    header[28] = (byteRate and 0xff).toByte() // byte rate
-    header[29] = (byteRate shr 8 and 0xff).toByte()
-    header[30] = (byteRate shr 16 and 0xff).toByte()
-    header[31] = (byteRate shr 24 and 0xff).toByte()
-    header[32] = 2 // block align
-    header[33] = 0
-    header[34] = 16 // bits per sample
-    header[35] = 0
-    header[36] = 'd'.code.toByte()
-    header[37] = 'a'.code.toByte()
-    header[38] = 't'.code.toByte()
-    header[39] = 'a'.code.toByte()
-    header[40] = (pcmDataSize and 0xff).toByte()
-    header[41] = (pcmDataSize shr 8 and 0xff).toByte()
-    header[42] = (pcmDataSize shr 16 and 0xff).toByte()
-    header[43] = (pcmDataSize shr 24 and 0xff).toByte()
-
-    return header + currentPcm
+            // Pack back to little-endian bytes
+            val out = ByteArray(resampled.size * 2)
+            for (i in resampled.indices) {
+                val s = resampled[i].toInt()
+                out[i * 2] = (s and 0xFF).toByte()
+                out[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
+            }
+            return out
         } catch (e: Throwable) {
             return null
         }
+    }
+
+    /** Heuristic: float32 samples are within [-1, 1], so exponent bytes stay small. */
+    private fun looksLikeFloat(data: ByteArray): Boolean {
+        val buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        var checked = 0
+        while (buf.remaining() >= 4 && checked < 64) {
+            val f = buf.float
+            if (f.isNaN() || kotlin.math.abs(f) > 32.0f) return false
+            checked++
+        }
+        return checked > 0
+    }
+
+    /** Convert interleaved PCM of any supported bit depth to mono 16-bit samples. */
+    private fun toMono16(data: ByteArray, channels: Int, bitsPerSample: Int, isFloat: Boolean): ShortArray? {
+        val bytesPerSample = bitsPerSample / 8
+        if (bytesPerSample !in 1..4) return null
+        val frameSize = bytesPerSample * channels
+        if (frameSize == 0) return null
+        val frames = data.size / frameSize
+        if (frames == 0) return null
+
+        val buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        val mono = ShortArray(frames)
+
+        for (frame in 0 until frames) {
+            var sum = 0L
+            for (ch in 0 until channels) {
+                val offset = frame * frameSize + ch * bytesPerSample
+                val sample: Int = when {
+                    isFloat && bytesPerSample == 4 -> {
+                        val f = buf.getFloat(offset).coerceIn(-1.0f, 1.0f)
+                        (f * Short.MAX_VALUE).toInt()
+                    }
+                    bytesPerSample == 1 -> ((data[offset].toInt() and 0xFF) - 128) shl 8
+                    bytesPerSample == 2 -> buf.getShort(offset).toInt()
+                    bytesPerSample == 3 -> {
+                        val b0 = data[offset].toInt() and 0xFF
+                        val b1 = data[offset + 1].toInt() and 0xFF
+                        val b2 = data[offset + 2].toInt() // sign byte
+                        ((b2 shl 16) or (b1 shl 8) or b0) shr 8
+                    }
+                    else -> buf.getInt(offset) shr 16 // 32-bit int PCM
+                }
+                sum += sample
+            }
+            mono[frame] = (sum / channels).toInt().coerceIn(-32768, 32767).toShort()
+        }
+        return mono
+    }
+
+    /** Linear-interpolation resampler (mono 16-bit). */
+    private fun resampleLinear(input: ShortArray, fromRate: Int, toRate: Int): ShortArray {
+        if (input.isEmpty()) return input
+        val ratio = fromRate.toDouble() / toRate.toDouble()
+        val outLength = (input.size / ratio).toInt().coerceAtLeast(1)
+        val out = ShortArray(outLength)
+        for (i in 0 until outLength) {
+            val srcPos = i * ratio
+            val idx = srcPos.toInt().coerceAtMost(input.size - 1)
+            val frac = srcPos - idx
+            val s0 = input[idx].toInt()
+            val s1 = input[(idx + 1).coerceAtMost(input.size - 1)].toInt()
+            out[i] = (s0 + (s1 - s0) * frac).toInt().coerceIn(-32768, 32767).toShort()
+        }
+        return out
     }
 }

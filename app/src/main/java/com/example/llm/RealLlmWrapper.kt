@@ -22,20 +22,35 @@ class RealLlmWrapper(context: Context, modelPath: String) : LlmWrapper {
         private const val TAG = "RealLlmWrapper"
         /** Timeout for a single inference call (seconds). */
         private const val INFERENCE_TIMEOUT_SECONDS = 120L
+        /** Context window size; audio inference needs room for audio tokens + output. */
+        private const val MAX_NUM_TOKENS = 4096
     }
 
     init {
+        // cacheDir = null makes the engine write XNNPack/adapter caches next to the
+        // model file. That only works when the model dir is writable (app-private
+        // storage). For models in shared storage (/storage/emulated/0/...) scoped
+        // storage blocks those writes and audio/vision init fails — so fall back to
+        // an app-owned cache directory.
+        val modelDir = java.io.File(modelPath).parentFile
+        val cacheDir = if (modelDir != null && modelDir.canWrite()) {
+            null
+        } else {
+            context.filesDir.absolutePath.also {
+                Log.i(TAG, "Model directory not writable; using app cacheDir: $it")
+            }
+        }
+
         var initializedEngine: Engine? = null
         try {
-            // cacheDir = null lets the engine use the model file's parent directory,
-            // which is where Gallery stores audio/vision adapter cache files.
             val options = EngineConfig(
                 modelPath = modelPath,
                 backend = Backend.GPU(),
-                maxNumTokens = 1024,
+                // Must fit ~188 audio tokens per 30s chunk + prompt + transcription output
+                maxNumTokens = MAX_NUM_TOKENS,
                 visionBackend = null,
-                audioBackend = Backend.CPU(),
-                cacheDir = null
+                audioBackend = Backend.CPU(), // must be CPU for Gemma 3n audio encoder
+                cacheDir = cacheDir
             )
             initializedEngine = Engine(options)
             initializedEngine.initialize()
@@ -46,10 +61,10 @@ class RealLlmWrapper(context: Context, modelPath: String) : LlmWrapper {
                 val fallbackOptions = EngineConfig(
                     modelPath = modelPath,
                     backend = Backend.CPU(),
-                    maxNumTokens = 1024,
+                    maxNumTokens = MAX_NUM_TOKENS,
                     visionBackend = null,
                     audioBackend = Backend.CPU(),
-                    cacheDir = null
+                    cacheDir = cacheDir
                 )
                 initializedEngine = Engine(fallbackOptions)
                 initializedEngine.initialize()

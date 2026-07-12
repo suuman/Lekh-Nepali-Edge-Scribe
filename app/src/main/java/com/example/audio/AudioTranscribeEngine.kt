@@ -252,11 +252,11 @@ class AudioTranscribeEngine(
      * Attempt native model audio transcription by sending audio bytes to the model.
      * Returns transcribed text on success, or null if the model doesn't support audio.
      *
-     * Strategy:
-     * 1. Reset conversation to clear any stale text-only state
-     * 2. Wrap PCM in WAV header (model's audio encoder expects formatted audio)
-     * 3. If WAV fails, try raw PCM as fallback
-     * 4. If both fail, return null to signal SpeechRecognizer fallback
+     * The audio encoder consumes WAV-formatted bytes (16kHz/mono/16-bit + 44-byte
+     * header) — the same format the AI Edge Gallery app passes to Content.AudioBytes.
+     * Each 30s chunk gets a FRESH conversation: audio tokens (~188/chunk) accumulate
+     * fast, and a shared conversation overflows the context window after the first
+     * chunk, which surfaces as a native error mid-file.
      */
     private suspend fun tryModelAudioInference(pcmBytes: ByteArray, isStrict: Boolean): String? {
         if (modelHelper?.isInitialized != true) return null
@@ -264,40 +264,35 @@ class AudioTranscribeEngine(
         val chunks = chunkAudioBytes(pcmBytes)
         Log.i(TAG, "Attempting native audio inference with ${chunks.size} chunk(s)...")
 
-        // Reset conversation to clean state before audio inference.
-        // This prevents stale text-only conversation state from interfering.
-        modelHelper.resetConversation()
+        val prompt = if (isStrict) {
+            "Transcribe the following Nepali audio into clean, accurate Nepali text. " +
+            "Remove filler words, hesitations, repetitions, and background noise artifacts. " +
+            "Output only the strict Nepali transcription text, nothing else."
+        } else {
+            "Transcribe the following Nepali audio verbatim into Nepali text. " +
+            "Include all spoken words as-is. Output only the transcription text."
+        }
 
         val transcriptionParts = mutableListOf<String>()
 
         for ((index, chunk) in chunks.withIndex()) {
             Log.i(TAG, "Native inference chunk ${index + 1}/${chunks.size} (${chunk.size} bytes)")
 
-            val prompt = if (isStrict) {
-                "Transcribe the following Nepali audio into clean, accurate Nepali text. " +
-                "Remove filler words, hesitations, repetitions, and background noise artifacts. " +
-                "Output only the strict Nepali transcription text, nothing else."
-            } else {
-                "Transcribe the following Nepali audio verbatim into Nepali text. " +
-                "Include all spoken words as-is. Output only the transcription text."
-            }
+            // Fresh conversation per chunk: clears prior audio/text tokens so each
+            // 30s chunk fits comfortably in the context window.
+            modelHelper.resetConversation()
 
-            // Try WAV-wrapped first — the model's audio encoder expects audio with
-            // format metadata (sample rate, bit depth, channels) from the WAV header.
-            val wavChunk = AudioDecoder.wrapInWavHeader(chunk)
-            var result = modelHelper.generateResponse(prompt, wavChunk)
+            val wavChunk = AudioDecoder.wrapInWavHeader(capToModelLimit(chunk))
+            val result = modelHelper.generateResponse(prompt, wavChunk)
 
-            // Check for model-level errors
             if (isModelAudioError(result)) {
-                Log.w(TAG, "WAV-wrapped failed: $result. Trying raw PCM...")
-
-                // Fallback: try raw PCM bytes directly
-                result = modelHelper.generateResponse(prompt, chunk)
-
-                if (isModelAudioError(result)) {
-                    Log.w(TAG, "Raw PCM also failed: $result. Model does not support audio.")
-                    return null // Signal: model doesn't support audio, use fallback
+                if (index == 0) {
+                    Log.w(TAG, "Audio inference failed on first chunk: $result. Falling back.")
+                    return null // Model/audio backend unavailable — use fallback
                 }
+                // Later chunk failed — keep what we have instead of losing everything
+                Log.w(TAG, "Chunk ${index + 1} failed: $result. Keeping partial transcription.")
+                break
             }
 
             val cleanResult = result.trim()
@@ -527,17 +522,28 @@ class AudioTranscribeEngine(
      * Tries WavProcessor first, then falls back to MediaCodec-based AudioDecoder.
      */
     private fun decodeAudioToPcm(rawBytes: ByteArray): ByteArray? {
-        // Fast path: try WavProcessor for direct WAV handling
+        // Fast path: try WavProcessor for direct WAV handling (returns raw normalized PCM)
         val wavResult = WavProcessor.processWav(rawBytes)
         if (wavResult != null) {
-            Log.i(TAG, "Decoded as WAV via WavProcessor (${wavResult.size} bytes output)")
-            // WavProcessor returns a complete WAV with header — strip the 44-byte header to get raw PCM
-            return if (wavResult.size > 44) wavResult.copyOfRange(44, wavResult.size) else wavResult
+            Log.i(TAG, "Decoded as WAV via WavProcessor (${wavResult.size} bytes PCM)")
+            return wavResult
         }
 
         // Slower path: use MediaExtractor/MediaCodec for MP3, OGG, AAC, FLAC, M4A, etc.
         Log.i(TAG, "WAV decode failed, trying MediaCodec for non-WAV format...")
         return AudioDecoder.decodeFromBytes(rawBytes, context)
+    }
+
+    /**
+     * Hard cap on audio fed to the model in a single inference call.
+     * The Gemma 3n audio encoder accepts at most 30 seconds per clip — anything
+     * longer must go through [chunkAudioBytes] and separate inference calls.
+     */
+    private fun capToModelLimit(pcmChunk: ByteArray): ByteArray {
+        val maxBytes = CHUNK_DURATION_SECONDS * TARGET_SAMPLE_RATE * 2 // 16-bit mono
+        if (pcmChunk.size <= maxBytes) return pcmChunk
+        Log.w(TAG, "Chunk exceeds ${CHUNK_DURATION_SECONDS}s model limit (${pcmChunk.size} bytes); trimming to $maxBytes")
+        return pcmChunk.copyOfRange(0, maxBytes)
     }
 
     /**
@@ -566,15 +572,51 @@ class AudioTranscribeEngine(
         return chunks
     }
 
-    fun exportToTextFile(fileName: String, text: String): Result<File> {
+    /**
+     * Export transcription to a user-visible .txt file in Downloads/LekhNepaliScribe.
+     * Returns the display path of the created file.
+     */
+    fun exportToTextFile(fileName: String, text: String): Result<String> {
+        val cleanName = fileName.replace("[^a-zA-Z0-9.-]".toRegex(), "_")
         return try {
-            val dir = context.getExternalFilesDir(null)
-            val cleanName = fileName.replace("[^a-zA-Z0-9.-]".toRegex(), "_")
-            val file = File(dir, "$cleanName.txt")
-            file.writeText(text)
-            Result.success(file)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                // MediaStore: no storage permission needed, file visible in Downloads
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, "$cleanName.txt")
+                    put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                    put(
+                        android.provider.MediaStore.MediaColumns.RELATIVE_PATH,
+                        android.os.Environment.DIRECTORY_DOWNLOADS + "/LekhNepaliScribe"
+                    )
+                }
+                val uri = context.contentResolver.insert(
+                    android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
+                ) ?: throw IllegalStateException("MediaStore insert failed")
+                context.contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(text.toByteArray(Charsets.UTF_8))
+                } ?: throw IllegalStateException("Could not open output stream")
+                Result.success("Download/LekhNepaliScribe/$cleanName.txt")
+            } else {
+                @Suppress("DEPRECATION")
+                val downloads = android.os.Environment.getExternalStoragePublicDirectory(
+                    android.os.Environment.DIRECTORY_DOWNLOADS
+                )
+                val dir = File(downloads, "LekhNepaliScribe")
+                if (!dir.exists()) dir.mkdirs()
+                val file = File(dir, "$cleanName.txt")
+                file.writeText(text)
+                Result.success(file.absolutePath)
+            }
         } catch (e: Exception) {
-            Result.failure(e)
+            // Last resort: app-private external dir (always writable, but only
+            // reachable via Android/data/<package>/files)
+            try {
+                val file = File(context.getExternalFilesDir(null), "$cleanName.txt")
+                file.writeText(text)
+                Result.success(file.absolutePath)
+            } catch (inner: Exception) {
+                Result.failure(e)
+            }
         }
     }
 
