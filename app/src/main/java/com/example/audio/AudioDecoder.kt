@@ -23,8 +23,10 @@ object AudioDecoder {
     private const val TARGET_CHANNELS = 1
     private const val TARGET_BITS = 16
     private const val CODEC_TIMEOUT_US = 10_000L // 10ms
-    // Memory bound only — long files are chunked into 30s pieces downstream
+    // Memory bound for the in-memory decode path only
     private const val MAX_DURATION_SECONDS = 600
+    // Streaming path writes to disk (~115 MB/hour), so it can afford much more
+    private const val MAX_STREAM_DURATION_SECONDS = 3600
 
     /**
      * Result of decoding, containing normalized PCM data and metadata.
@@ -52,6 +54,26 @@ object AudioDecoder {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to decode audio from URI: ${e.message}", e)
             return null
+        } finally {
+            extractor.release()
+        }
+    }
+
+    /**
+     * Stream-decode audio from a content URI into a raw PCM file (16kHz mono 16-bit),
+     * never holding more than one codec buffer in memory. This is the OOM-safe path
+     * for large files — the caller reads the resulting file back in 30s chunks.
+     *
+     * @return number of PCM bytes written, or -1 on failure
+     */
+    fun decodeUriToPcmFile(context: Context, uri: Uri, outFile: java.io.File): Long {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(context, uri, null)
+            return streamDecodeToFile(extractor, outFile)
+        } catch (e: Exception) {
+            Log.e(TAG, "Streaming decode from URI failed: ${e.message}", e)
+            return -1
         } finally {
             extractor.release()
         }
@@ -236,6 +258,243 @@ object AudioDecoder {
         } finally {
             try { codec.stop() } catch (_: Exception) {}
             try { codec.release() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Streaming variant of [decodeFromExtractor]: each codec output buffer is
+     * normalized (mono + 16kHz) immediately and appended to [outFile], so peak
+     * memory stays at one codec buffer instead of the whole decoded track.
+     *
+     * @return number of normalized PCM bytes written, or -1 on failure
+     */
+    private fun streamDecodeToFile(extractor: MediaExtractor, outFile: java.io.File): Long {
+        var audioTrackIndex = -1
+        var audioFormat: MediaFormat? = null
+
+        for (i in 0 until extractor.trackCount) {
+            val format = extractor.getTrackFormat(i)
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+            if (mime.startsWith("audio/")) {
+                audioTrackIndex = i
+                audioFormat = format
+                break
+            }
+        }
+
+        if (audioTrackIndex == -1 || audioFormat == null) {
+            Log.e(TAG, "No audio track found in the file")
+            return -1
+        }
+
+        extractor.selectTrack(audioTrackIndex)
+
+        val mime = audioFormat.getString(MediaFormat.KEY_MIME) ?: return -1
+        val sourceSampleRate = audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+        val sourceChannels = audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+
+        Log.i(TAG, "Streaming decode: mime=$mime, sampleRate=$sourceSampleRate, channels=$sourceChannels")
+
+        val codec = try {
+            MediaCodec.createDecoderByType(mime)
+        } catch (e: Exception) {
+            Log.e(TAG, "Cannot create decoder for mime type: $mime", e)
+            return -1
+        }
+
+        try {
+            codec.configure(audioFormat, null, null, 0)
+            codec.start()
+
+            val bufferInfo = MediaCodec.BufferInfo()
+            var inputDone = false
+            var outputDone = false
+
+            var outputSampleRate = sourceSampleRate
+            var outputChannels = sourceChannels
+            var normalizer: PcmStreamNormalizer? = null
+
+            // Cap on normalized output (16kHz mono 16-bit)
+            val maxOutBytes = MAX_STREAM_DURATION_SECONDS.toLong() * TARGET_SAMPLE_RATE * 2
+            var written = 0L
+
+            outFile.outputStream().buffered().use { out ->
+                while (!outputDone && written < maxOutBytes) {
+                    if (!inputDone) {
+                        val inputBufferIndex = codec.dequeueInputBuffer(CODEC_TIMEOUT_US)
+                        if (inputBufferIndex >= 0) {
+                            val inputBuffer = codec.getInputBuffer(inputBufferIndex) ?: continue
+                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                            if (sampleSize < 0) {
+                                codec.queueInputBuffer(inputBufferIndex, 0, 0, 0,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                inputDone = true
+                            } else {
+                                val presentationTimeUs = extractor.sampleTime
+                                codec.queueInputBuffer(inputBufferIndex, 0, sampleSize, presentationTimeUs, 0)
+                                extractor.advance()
+
+                                if (presentationTimeUs > MAX_STREAM_DURATION_SECONDS * 1_000_000L) {
+                                    val eosIndex = codec.dequeueInputBuffer(CODEC_TIMEOUT_US)
+                                    if (eosIndex >= 0) {
+                                        codec.queueInputBuffer(eosIndex, 0, 0, 0,
+                                            MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                    }
+                                    inputDone = true
+                                }
+                            }
+                        }
+                    }
+
+                    val outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, CODEC_TIMEOUT_US)
+                    when {
+                        outputBufferIndex >= 0 -> {
+                            if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                                outputDone = true
+                            }
+
+                            if (bufferInfo.size > 0) {
+                                val outputBuffer = codec.getOutputBuffer(outputBufferIndex) ?: continue
+                                val chunk = ByteArray(bufferInfo.size)
+                                outputBuffer.get(chunk)
+
+                                if (normalizer == null) {
+                                    normalizer = PcmStreamNormalizer(outputSampleRate, outputChannels)
+                                }
+                                val normalized = normalizer!!.feed(chunk)
+                                val toWrite = minOf(normalized.size.toLong(), maxOutBytes - written).toInt()
+                                if (toWrite > 0) {
+                                    out.write(normalized, 0, toWrite)
+                                    written += toWrite
+                                }
+                            }
+
+                            codec.releaseOutputBuffer(outputBufferIndex, false)
+                        }
+                        outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            val newFormat = codec.outputFormat
+                            if (newFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                                outputSampleRate = newFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                            }
+                            if (newFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                                outputChannels = newFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                            }
+                            if (normalizer != null) {
+                                // Mid-stream format change after data was produced: rare;
+                                // restart normalization state with the new format
+                                Log.w(TAG, "Output format changed mid-stream; resetting normalizer")
+                                normalizer = PcmStreamNormalizer(outputSampleRate, outputChannels)
+                            }
+                            Log.i(TAG, "Output format changed: rate=$outputSampleRate, channels=$outputChannels")
+                        }
+                        // INFO_TRY_AGAIN_LATER — just loop
+                    }
+                }
+
+                normalizer?.flush()?.let { tail ->
+                    val toWrite = minOf(tail.size.toLong(), maxOutBytes - written).toInt()
+                    if (toWrite > 0) {
+                        out.write(tail, 0, toWrite)
+                        written += toWrite
+                    }
+                }
+            }
+
+            Log.i(TAG, "Streaming decode complete: $written bytes of normalized PCM")
+            return if (written > 0) written else -1
+        } catch (e: Exception) {
+            Log.e(TAG, "Streaming decode failed: ${e.message}", e)
+            return -1
+        } finally {
+            try { codec.stop() } catch (_: Exception) {}
+            try { codec.release() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Incremental PCM normalizer: downmixes interleaved 16-bit frames to mono and
+     * resamples to 16kHz, carrying interpolation state across feed() calls so the
+     * whole track never has to be in memory at once.
+     */
+    internal class PcmStreamNormalizer(sourceSampleRate: Int, private val channels: Int) {
+        private val needsResample =
+            sourceSampleRate != TARGET_SAMPLE_RATE && sourceSampleRate in 4000..192000
+        private val ratio = sourceSampleRate.toDouble() / TARGET_SAMPLE_RATE
+        private var carry = ByteArray(0)   // partial input frame between feeds
+        private var prevSample = 0         // last mono sample of the previous feed
+        private var monoBase = 0L          // global index of the next incoming mono sample
+        private var outCount = 0L          // resampled samples emitted so far
+
+        fun feed(input: ByteArray): ByteArray {
+            val data = if (carry.isEmpty()) input else carry + input
+            val frameBytes = channels * 2
+            val frames = data.size / frameBytes
+            val used = frames * frameBytes
+            carry = if (used < data.size) data.copyOfRange(used, data.size) else ByteArray(0)
+            if (frames == 0) return ByteArray(0)
+
+            // Downmix to mono
+            val mono = IntArray(frames)
+            for (f in 0 until frames) {
+                var sum = 0L
+                val base = f * frameBytes
+                for (ch in 0 until channels) {
+                    val off = base + ch * 2
+                    val lsb = data[off].toInt() and 0xFF
+                    val msb = data[off + 1].toInt()
+                    sum += (msb shl 8) or lsb
+                }
+                mono[f] = (sum / channels).toInt()
+            }
+
+            val result: ByteArray
+            if (!needsResample) {
+                result = ByteArray(frames * 2)
+                for (i in 0 until frames) {
+                    val s = mono[i].coerceIn(-32768, 32767)
+                    result[i * 2] = (s and 0xFF).toByte()
+                    result[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
+                }
+            } else {
+                // Emit output sample n at source position n*ratio while its upper
+                // interpolation neighbor (idx+1) is available in this feed
+                val lastIdx = monoBase + frames - 1
+                val outStream = ByteArrayOutputStream()
+                while (true) {
+                    val pos = outCount * ratio
+                    val idx = pos.toLong()
+                    if (idx + 1 > lastIdx) break
+                    val s0 = if (idx < monoBase) prevSample else mono[(idx - monoBase).toInt()]
+                    val s1 = mono[(idx + 1 - monoBase).toInt()]
+                    val frac = pos - idx
+                    val sample = (s0 + (s1 - s0) * frac).toInt().coerceIn(-32768, 32767)
+                    outStream.write(sample and 0xFF)
+                    outStream.write((sample shr 8) and 0xFF)
+                    outCount++
+                }
+                result = outStream.toByteArray()
+            }
+
+            prevSample = mono[frames - 1]
+            monoBase += frames
+            return result
+        }
+
+        /** Emit trailing output samples whose position falls on the final input sample. */
+        fun flush(): ByteArray {
+            if (!needsResample || monoBase == 0L) return ByteArray(0)
+            val outStream = ByteArrayOutputStream()
+            val lastIdx = monoBase - 1
+            while (true) {
+                val pos = outCount * ratio
+                val idx = pos.toLong()
+                if (idx > lastIdx) break
+                val sample = prevSample.coerceIn(-32768, 32767)
+                outStream.write(sample and 0xFF)
+                outStream.write((sample shr 8) and 0xFF)
+                outCount++
+            }
+            return outStream.toByteArray()
         }
     }
 

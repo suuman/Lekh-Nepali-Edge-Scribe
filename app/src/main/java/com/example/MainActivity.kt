@@ -389,7 +389,11 @@ fun TranscriberScreen(
                             ) {
                                 CircularProgressIndicator()
                                 Text(
-                                    text = if (isRecording) "प्रत्यक्ष बोली पहिचान गरिदैछ..." else "स्थानीय एआईले फाईल प्रशोधन गर्दैछ...",
+                                    text = when {
+                                        isRecording -> "प्रत्यक्ष बोली पहिचान गरिदैछ..."
+                                        state.progressText != null -> state.progressText
+                                        else -> "स्थानीय एआईले फाईल प्रशोधन गर्दैछ..."
+                                    },
                                     style = MaterialTheme.typography.bodyMedium,
                                     textAlign = TextAlign.Center
                                 )

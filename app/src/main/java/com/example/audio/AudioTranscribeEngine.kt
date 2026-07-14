@@ -39,7 +39,7 @@ class AudioTranscribeEngine(
 
     sealed interface State {
         object Idle : State
-        object Processing : State
+        data class Processing(val progressText: String? = null) : State
         data class Success(val text: String, val fromFile: Boolean) : State
         data class Error(val message: String) : State
     }
@@ -47,7 +47,7 @@ class AudioTranscribeEngine(
     companion object {
         private const val TAG = "AudioTranscribeEngine"
 
-        /** Maximum file size to load into memory (50 MB). */
+        /** Maximum file size for the in-memory fallback decode path (50 MB). */
         private const val MAX_FILE_SIZE_BYTES = 50L * 1024 * 1024
 
         /** Duration of each audio chunk in seconds for chunked transcription. */
@@ -89,7 +89,7 @@ class AudioTranscribeEngine(
             override fun onReadyForSpeech(params: Bundle?) {}
             override fun onBeginningOfSpeech() {
                 _isRecording.value = true
-                _transcriptionState.value = State.Processing
+                _transcriptionState.value = State.Processing()
             }
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
@@ -165,33 +165,41 @@ class AudioTranscribeEngine(
      * 3. If strict mode is on and we got raw text, run it through the LLM for cleanup
      */
     fun transcribeAudioFile(uri: Uri, isStrict: Boolean) {
-        _transcriptionState.value = State.Processing
+        _transcriptionState.value = State.Processing()
         scope.launch(Dispatchers.Default) {
+            val pcmFile = File(context.cacheDir, "transcribe_pcm_${System.currentTimeMillis()}.raw")
             try {
-                // Step 1: Read raw bytes from URI
-                val rawBytes = readAudioBytesFromUri(uri)
-                    ?: throw IllegalStateException("फाइल पढ्न सकिएन (Failed to read audio file). कृपया अर्को फाइल प्रयास गर्नुहोस्।")
+                // Step 1: Stream-decode straight from the URI into a temp PCM file.
+                // Memory stays at one codec buffer regardless of file size — this is
+                // what prevents OOM on long recordings.
+                var decodedBytes = AudioDecoder.decodeUriToPcmFile(context, uri, pcmFile)
 
-                Log.i(TAG, "Read ${rawBytes.size} bytes from URI: $uri")
+                // Step 1b: Fallback for containers MediaExtractor can't stream
+                // (e.g. float32 WAVs): old in-memory decode, guarded by a size cap.
+                if (decodedBytes <= 0) {
+                    Log.i(TAG, "Streaming decode failed, trying in-memory decode fallback...")
+                    val rawBytes = readAudioBytesFromUri(uri)
+                        ?: throw IllegalStateException("फाइल पढ्न सकिएन (Failed to read audio file). कृपया अर्को फाइल प्रयास गर्नुहोस्।")
 
-                // Step 1b: File size guard
-                if (rawBytes.size > MAX_FILE_SIZE_BYTES) {
-                    throw IllegalStateException(
-                        "फाइल साइज धेरै ठूलो छ (${rawBytes.size / (1024 * 1024)} MB). " +
-                        "अधिकतम ${MAX_FILE_SIZE_BYTES / (1024 * 1024)} MB सम्म समर्थित छ।"
-                    )
+                    if (rawBytes.size > MAX_FILE_SIZE_BYTES) {
+                        throw IllegalStateException(
+                            "फाइल साइज धेरै ठूलो छ (${rawBytes.size / (1024 * 1024)} MB). " +
+                            "अधिकतम ${MAX_FILE_SIZE_BYTES / (1024 * 1024)} MB सम्म समर्थित छ।"
+                        )
+                    }
+
+                    val pcmBytes = decodeAudioToPcm(rawBytes)
+                        ?: throw IllegalStateException(
+                            "अडियो फाइल डिकोड गर्न सकिएन (Failed to decode audio). " +
+                            "समर्थित ढाँचाहरू: WAV, MP3, OGG, FLAC, M4A, AAC"
+                        )
+                    pcmFile.writeBytes(pcmBytes)
+                    decodedBytes = pcmBytes.size.toLong()
                 }
 
-                // Step 2: Decode to normalized 16kHz/16-bit/mono PCM
-                val pcmBytes = decodeAudioToPcm(rawBytes)
-                    ?: throw IllegalStateException(
-                        "अडियो फाइल डिकोड गर्न सकिएन (Failed to decode audio). " +
-                        "समर्थित ढाँचाहरू: WAV, MP3, OGG, FLAC, M4A, AAC"
-                    )
+                Log.i(TAG, "Decoded to $decodedBytes bytes of normalized PCM at $pcmFile")
 
-                Log.i(TAG, "Decoded to ${pcmBytes.size} bytes of normalized PCM")
-
-                // Step 3: Check model availability
+                // Step 2: Check model availability
                 if (modelHelper?.isInitialized != true) {
                     launch(Dispatchers.Main) {
                         _transcriptionState.value = State.Error(
@@ -202,14 +210,14 @@ class AudioTranscribeEngine(
                     return@launch
                 }
 
-                // Step 4: Try native model audio inference first
-                var transcription = tryModelAudioInference(pcmBytes, isStrict)
+                // Step 3: Try native model audio inference first (30s chunks from disk)
+                var transcription = tryModelAudioInference(pcmFile, isStrict)
 
-                // Step 5: If native audio failed, fall back to SpeechRecognizer playback
+                // Step 4: If native audio failed, fall back to SpeechRecognizer playback
                 if (transcription == null) {
                     Log.i(TAG, "Native audio inference failed/unsupported, falling back to SpeechRecognizer playback...")
 
-                    val rawText = transcribeViaPlayback(pcmBytes)
+                    val rawText = transcribeViaPlayback(pcmFile)
 
                     if (rawText.isNullOrBlank()) {
                         throw IllegalStateException(
@@ -218,7 +226,7 @@ class AudioTranscribeEngine(
                         )
                     }
 
-                    // Step 6: If strict mode, run raw text through LLM for cleanup
+                    // Step 5: If strict mode, run raw text through LLM for cleanup
                     transcription = if (isStrict && modelHelper.isInitialized) {
                         val cleanedText = cleanTextWithModel(rawText)
                         cleanedText ?: rawText // fallback to raw if LLM cleanup fails
@@ -240,6 +248,8 @@ class AudioTranscribeEngine(
                         e.localizedMessage ?: "फाइल ट्रान्सक्रिप्सन असफल भयो (File transcription failed)"
                     )
                 }
+            } finally {
+                pcmFile.delete()
             }
         }
     }
@@ -258,11 +268,8 @@ class AudioTranscribeEngine(
      * fast, and a shared conversation overflows the context window after the first
      * chunk, which surfaces as a native error mid-file.
      */
-    private suspend fun tryModelAudioInference(pcmBytes: ByteArray, isStrict: Boolean): String? {
+    private suspend fun tryModelAudioInference(pcmFile: File, isStrict: Boolean): String? {
         if (modelHelper?.isInitialized != true) return null
-
-        val chunks = chunkAudioBytes(pcmBytes)
-        Log.i(TAG, "Attempting native audio inference with ${chunks.size} chunk(s)...")
 
         val prompt = if (isStrict) {
             "Transcribe the following Nepali audio into clean, accurate Nepali text. " +
@@ -274,32 +281,40 @@ class AudioTranscribeEngine(
         }
 
         val transcriptionParts = mutableListOf<String>()
+        var backendUnavailable = false
 
-        for ((index, chunk) in chunks.withIndex()) {
-            Log.i(TAG, "Native inference chunk ${index + 1}/${chunks.size} (${chunk.size} bytes)")
+        forEachPcmChunk(pcmFile) { chunk, index, total ->
+            Log.i(TAG, "Native inference chunk ${index + 1}/$total (${chunk.size} bytes)")
+            _transcriptionState.value = State.Processing(
+                "स्थानीय एआईले फाईल प्रशोधन गर्दैछ... (भाग ${index + 1}/$total)"
+            )
 
             // Fresh conversation per chunk: clears prior audio/text tokens so each
             // 30s chunk fits comfortably in the context window.
             modelHelper.resetConversation()
 
-            val wavChunk = AudioDecoder.wrapInWavHeader(capToModelLimit(chunk))
+            val wavChunk = AudioDecoder.wrapInWavHeader(chunk)
             val result = modelHelper.generateResponse(prompt, wavChunk)
 
             if (isModelAudioError(result)) {
                 if (index == 0) {
                     Log.w(TAG, "Audio inference failed on first chunk: $result. Falling back.")
-                    return null // Model/audio backend unavailable — use fallback
+                    backendUnavailable = true
+                } else {
+                    // Later chunk failed — keep what we have instead of losing everything
+                    Log.w(TAG, "Chunk ${index + 1} failed: $result. Keeping partial transcription.")
                 }
-                // Later chunk failed — keep what we have instead of losing everything
-                Log.w(TAG, "Chunk ${index + 1} failed: $result. Keeping partial transcription.")
-                break
+                return@forEachPcmChunk false
             }
 
             val cleanResult = result.trim()
             if (cleanResult.isNotEmpty()) {
                 transcriptionParts.add(cleanResult)
             }
+            true
         }
+
+        if (backendUnavailable) return null // Model/audio backend unavailable — use fallback
 
         return if (transcriptionParts.isNotEmpty()) {
             transcriptionParts.joinToString(" ")
@@ -331,18 +346,21 @@ class AudioTranscribeEngine(
      * Transcribe audio by playing PCM through AudioTrack while SpeechRecognizer listens.
      * Returns raw transcribed text, or null on failure.
      */
-    private suspend fun transcribeViaPlayback(pcmBytes: ByteArray): String? {
-        // Chunk into segments and transcribe each via playback
-        val chunks = chunkAudioBytes(pcmBytes)
+    private suspend fun transcribeViaPlayback(pcmFile: File): String? {
+        // Read 30s segments from disk and transcribe each via playback
         val transcriptionParts = mutableListOf<String>()
 
-        for ((index, chunk) in chunks.withIndex()) {
-            Log.i(TAG, "Playback transcription chunk ${index + 1}/${chunks.size} (${chunk.size} bytes)")
+        forEachPcmChunk(pcmFile) { chunk, index, total ->
+            Log.i(TAG, "Playback transcription chunk ${index + 1}/$total (${chunk.size} bytes)")
+            _transcriptionState.value = State.Processing(
+                "स्थानीय एआईले फाईल प्रशोधन गर्दैछ... (भाग ${index + 1}/$total)"
+            )
 
             val partialText = recognizePcmChunk(chunk)
             if (!partialText.isNullOrBlank()) {
                 transcriptionParts.add(partialText)
             }
+            true
         }
 
         return if (transcriptionParts.isNotEmpty()) {
@@ -535,41 +553,41 @@ class AudioTranscribeEngine(
     }
 
     /**
-     * Hard cap on audio fed to the model in a single inference call.
-     * The Gemma 3n audio encoder accepts at most 30 seconds per clip — anything
-     * longer must go through [chunkAudioBytes] and separate inference calls.
+     * Read [CHUNK_DURATION_SECONDS]-second chunks of 16-bit mono 16kHz PCM from a file,
+     * invoking [action] for each. Only one chunk (~960 KB) is ever in memory — this is
+     * how arbitrarily long recordings are processed without OOM. The Gemma 3n audio
+     * encoder accepts at most 30 seconds per clip, so chunks are sized to that limit.
+     *
+     * [action] returns false to stop early (e.g. on inference error).
      */
-    private fun capToModelLimit(pcmChunk: ByteArray): ByteArray {
-        val maxBytes = CHUNK_DURATION_SECONDS * TARGET_SAMPLE_RATE * 2 // 16-bit mono
-        if (pcmChunk.size <= maxBytes) return pcmChunk
-        Log.w(TAG, "Chunk exceeds ${CHUNK_DURATION_SECONDS}s model limit (${pcmChunk.size} bytes); trimming to $maxBytes")
-        return pcmChunk.copyOfRange(0, maxBytes)
-    }
-
-    /**
-     * Split PCM audio into chunks of [CHUNK_DURATION_SECONDS] seconds.
-     * Each chunk is raw 16-bit mono PCM at 16kHz.
-     */
-    private fun chunkAudioBytes(pcmBytes: ByteArray): List<ByteArray> {
+    private suspend fun forEachPcmChunk(
+        pcmFile: File,
+        action: suspend (chunk: ByteArray, index: Int, total: Int) -> Boolean
+    ) {
         val bytesPerChunk = CHUNK_DURATION_SECONDS * TARGET_SAMPLE_RATE * 2 // 16-bit = 2 bytes/sample
+        val total = ((pcmFile.length() + bytesPerChunk - 1) / bytesPerChunk).toInt().coerceAtLeast(1)
 
-        if (pcmBytes.size <= bytesPerChunk) {
-            return listOf(pcmBytes)
-        }
+        pcmFile.inputStream().buffered().use { input ->
+            var index = 0
+            while (true) {
+                val buf = ByteArray(bytesPerChunk)
+                var read = 0
+                while (read < buf.size) {
+                    val n = input.read(buf, read, buf.size - read)
+                    if (n < 0) break
+                    read += n
+                }
+                // Ensure we don't split mid-sample (2-byte alignment)
+                val aligned = read - (read % 2)
+                if (aligned <= 0) break
 
-        val chunks = mutableListOf<ByteArray>()
-        var offset = 0
-        while (offset < pcmBytes.size) {
-            val end = minOf(offset + bytesPerChunk, pcmBytes.size)
-            // Ensure we don't split mid-sample (2-byte alignment)
-            val alignedEnd = if ((end - offset) % 2 != 0) end - 1 else end
-            if (alignedEnd > offset) {
-                chunks.add(pcmBytes.copyOfRange(offset, alignedEnd))
+                val chunk = if (aligned == buf.size) buf else buf.copyOf(aligned)
+                if (!action(chunk, index, total)) break
+                index++
+
+                if (read < buf.size) break // EOF reached
             }
-            offset = alignedEnd
         }
-
-        return chunks
     }
 
     /**
