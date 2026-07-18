@@ -30,7 +30,10 @@ fun SettingsScreen(
 ) {
     val modelState by viewModel.modelState.collectAsState()
     val downloadState by viewModel.downloadState.collectAsState()
-    
+    val transcribeBackend by viewModel.transcribeBackend.collectAsState()
+    val geminiApiKeyInput by viewModel.geminiApiKeyInput.collectAsState()
+    val geminiKeyState by viewModel.geminiKeyState.collectAsState()
+
     val modelFileLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
@@ -47,7 +50,183 @@ fun SettingsScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
         contentPadding = PaddingValues(top = 16.dp, bottom = 32.dp)
     ) {
-        // 1. Google Edge AI Model Settings Card
+        // 0. Transcription Engine selection (Local Gemma vs Cloud Gemini)
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
+                ),
+                shape = RoundedCornerShape(20.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.SettingsSuggest,
+                            contentDescription = "Engine icon",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "ट्रान्सक्रिप्सन इन्जिन (Engine)",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = transcribeBackend == MainViewModel.TranscribeBackend.LOCAL,
+                            onClick = { viewModel.setTranscribeBackend(MainViewModel.TranscribeBackend.LOCAL) },
+                            label = { Text("स्थानीय Gemma 4 (Offline)", fontSize = 12.sp) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("engine_local_chip"),
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.PhoneAndroid,
+                                    contentDescription = "Local",
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        )
+                        FilterChip(
+                            selected = transcribeBackend == MainViewModel.TranscribeBackend.GEMINI,
+                            onClick = { viewModel.setTranscribeBackend(MainViewModel.TranscribeBackend.GEMINI) },
+                            label = { Text("Cloud Gemini (Online)", fontSize = 12.sp) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("engine_gemini_chip"),
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.Cloud,
+                                    contentDescription = "Gemini",
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        )
+                    }
+
+                    if (transcribeBackend == MainViewModel.TranscribeBackend.GEMINI) {
+                        Text(
+                            text = "अडियो Google Gemini API मा पठाइन्छ (इन्टरनेट आवश्यक)। " +
+                                "फाइलहरू एकै पटकमा प्रशोधन हुन्छन् — १०० MB भन्दा ठूला फाइलहरू मात्र भागहरूमा विभाजित गरिन्छ। " +
+                                "aistudio.google.com बाट नयाँ API key लिनुहोस्।",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp
+                        )
+
+                        OutlinedTextField(
+                            value = geminiApiKeyInput,
+                            onValueChange = { viewModel.updateGeminiApiKeyInput(it) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("gemini_api_key_input"),
+                            label = { Text("Gemini API Key", fontSize = 12.sp) },
+                            placeholder = { Text("AIza...", fontSize = 12.sp) },
+                            textStyle = MaterialTheme.typography.bodySmall,
+                            shape = RoundedCornerShape(12.dp),
+                            singleLine = true,
+                            isError = geminiKeyState is MainViewModel.GeminiKeyState.Invalid
+                        )
+
+                        when (val keyState = geminiKeyState) {
+                            is MainViewModel.GeminiKeyState.Validating -> {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(16.dp),
+                                        strokeWidth = 2.dp
+                                    )
+                                    Text(
+                                        text = "API key प्रमाणीकरण गर्दैछ...",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.tertiary
+                                    )
+                                }
+                            }
+                            is MainViewModel.GeminiKeyState.Valid -> {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.CheckCircle,
+                                        contentDescription = "Valid",
+                                        tint = androidx.compose.ui.graphics.Color(0xFF2E7D32),
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Text(
+                                        text = "प्रमाणित ✓ मोडेल: ${keyState.model}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = androidx.compose.ui.graphics.Color(0xFF2E7D32)
+                                    )
+                                }
+                            }
+                            is MainViewModel.GeminiKeyState.Invalid -> {
+                                Text(
+                                    text = keyState.error,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
+                            else -> {
+                                Text(
+                                    text = "प्रयोग गर्नु अघि API key प्रमाणित गर्नुहोस् (Validate the key before use)।",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
+
+                        Button(
+                            onClick = { viewModel.validateGeminiApiKey() },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(44.dp)
+                                .testTag("validate_gemini_key_button"),
+                            shape = RoundedCornerShape(12.dp),
+                            enabled = geminiApiKeyInput.isNotBlank() &&
+                                geminiKeyState !is MainViewModel.GeminiKeyState.Validating,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary
+                            )
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.VerifiedUser,
+                                contentDescription = "Validate",
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("API Key प्रमाणित गर्नुहोस् (Validate)")
+                        }
+                    } else {
+                        Text(
+                            text = "सबै प्रशोधन यसै यन्त्रमा हुन्छ — इन्टरनेट आवश्यक पर्दैन। तल Gemma 4 मोडेल लोड गर्नुहोस्।",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+            }
+        }
+
+        // 1. Google Edge AI Model Settings Card (local Gemma engine only —
+        // when Cloud Gemini is selected, only the API key section above applies)
+        if (transcribeBackend == MainViewModel.TranscribeBackend.LOCAL) {
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -567,5 +746,6 @@ fun SettingsScreen(
                 }
             }
         }
+        } // end LOCAL-only cards
     }
 }

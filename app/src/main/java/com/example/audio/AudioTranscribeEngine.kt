@@ -12,6 +12,7 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
+import com.example.llm.GeminiApiClient
 import com.example.llm.LlmChatModelHelper
 import java.io.File
 import kotlinx.coroutines.CompletableDeferred
@@ -63,7 +64,19 @@ class AudioTranscribeEngine(
 
         /** Timeout for speech recognition of a file chunk (ms). */
         private const val RECOGNITION_TIMEOUT_MS = 60_000L
+
+        /** Above this raw size, audio is sent inline (base64) vs the Files API. */
+        private const val GEMINI_INLINE_LIMIT_BYTES = 12L * 1024 * 1024
+
+        /** Gemini path: single request up to this size; larger files get segmented. */
+        private const val GEMINI_MAX_SINGLE_BYTES = 100L * 1024 * 1024
+
+        /** PCM bytes per Gemini segment when a file must be split (~52 min of 16kHz mono). */
+        private const val GEMINI_SEGMENT_PCM_BYTES = 95L * 1024 * 1024
     }
+
+    /** Configuration for cloud transcription via the Gemini API. */
+    data class GeminiConfig(val apiKey: String, val model: String)
 
     init {
         try {
@@ -259,9 +272,13 @@ class AudioTranscribeEngine(
      * 2. If model doesn't support audio, fall back to playback-based SpeechRecognizer
      * 3. If strict mode is on and we got raw text, run it through the LLM for cleanup
      */
-    fun transcribeAudioFile(uri: Uri, isStrict: Boolean) {
+    fun transcribeAudioFile(uri: Uri, isStrict: Boolean, gemini: GeminiConfig? = null) {
         _transcriptionState.value = State.Processing()
         scope.launch(Dispatchers.Default) {
+            if (gemini != null) {
+                transcribeWithGemini(uri, isStrict, gemini)
+                return@launch
+            }
             val pcmFile = File(context.cacheDir, "transcribe_pcm_${System.currentTimeMillis()}.raw")
             try {
                 // Step 1: Stream-decode straight from the URI into a temp PCM file.
@@ -346,6 +363,181 @@ class AudioTranscribeEngine(
             } finally {
                 pcmFile.delete()
             }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Cloud transcription via the Gemini API
+    //
+    // Unlike the local model, Gemini takes long audio in one request, so no 30s
+    // chunking: files up to GEMINI_MAX_SINGLE_BYTES go up whole (inline for small
+    // payloads, streamed through the Files API otherwise). Only larger files are
+    // split — into WAV segments produced by the streaming decoder.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private fun geminiPrompt(isStrict: Boolean) = if (isStrict) {
+        "Transcribe this Nepali audio into clean, accurate Nepali text. " +
+        "Remove filler words, hesitations, repetitions, and background noise artifacts. " +
+        "Output only the strict Nepali transcription text, nothing else."
+    } else {
+        "Transcribe this Nepali audio verbatim into Nepali text. " +
+        "Include all spoken words as-is. Output only the transcription text."
+    }
+
+    private suspend fun transcribeWithGemini(uri: Uri, isStrict: Boolean, config: GeminiConfig) {
+        try {
+            if (config.apiKey.isBlank() || config.model.isBlank()) {
+                throw IllegalStateException(
+                    "Gemini API कुञ्जी प्रमाणित गरिएको छैन। कृपया Settings मा गएर API key राखी Validate गर्नुहोस्।"
+                )
+            }
+
+            val prompt = geminiPrompt(isStrict)
+            val size = queryFileSize(uri)
+            val mime = resolveAudioMimeType(uri)
+            Log.i(TAG, "Gemini transcription: size=$size, mime=$mime, model=${config.model}")
+
+            val transcription = if (mime != null && size in 1..GEMINI_MAX_SINGLE_BYTES) {
+                if (size <= GEMINI_INLINE_LIMIT_BYTES) {
+                    _transcriptionState.value = State.Processing("Gemini मा पठाउँदैछ...")
+                    val bytes = readAudioBytesFromUri(uri)
+                        ?: throw IllegalStateException("फाइल पढ्न सकिएन (Failed to read audio file)")
+                    GeminiApiClient.transcribeInline(config.apiKey, config.model, bytes, mime, prompt)
+                        .getOrThrow()
+                } else {
+                    _transcriptionState.value = State.Processing("Gemini मा अपलोड गर्दैछ...")
+                    GeminiApiClient.transcribeViaFilesApi(
+                        config.apiKey, config.model, size, mime, prompt, "nepali-audio"
+                    ) { context.contentResolver.openInputStream(uri) }
+                        .getOrThrow()
+                }
+            } else {
+                // >100MB (or unknown size/format): decode to PCM and send in WAV segments
+                transcribeLargeWithGemini(uri, config, prompt)
+            }
+
+            Log.i(TAG, "Gemini transcription complete: ${transcription.length} chars")
+            _transcriptionState.value = State.Success(transcription, fromFile = true)
+        } catch (e: Throwable) {
+            Log.e(TAG, "Gemini transcription failed: ${e.localizedMessage}", e)
+            _transcriptionState.value = State.Error(
+                e.localizedMessage ?: "Gemini ट्रान्सक्रिप्सन असफल भयो (Gemini transcription failed)"
+            )
+        }
+    }
+
+    /**
+     * Gemini path for oversized or unrecognized files: stream-decode to 16kHz mono
+     * PCM on disk, then upload WAV segments of at most [GEMINI_SEGMENT_PCM_BYTES].
+     */
+    private suspend fun transcribeLargeWithGemini(uri: Uri, config: GeminiConfig, prompt: String): String {
+        val pcmFile = File(context.cacheDir, "gemini_pcm_${System.currentTimeMillis()}.raw")
+        try {
+            _transcriptionState.value = State.Processing("ठूलो फाइल डिकोड गर्दैछ...")
+            val decodedBytes = AudioDecoder.decodeUriToPcmFile(context, uri, pcmFile)
+            if (decodedBytes <= 0) {
+                throw IllegalStateException(
+                    "अडियो फाइल डिकोड गर्न सकिएन (Failed to decode audio). " +
+                    "समर्थित ढाँचाहरू: WAV, MP3, OGG, FLAC, M4A, AAC"
+                )
+            }
+
+            val segmentBytes = (GEMINI_SEGMENT_PCM_BYTES - (GEMINI_SEGMENT_PCM_BYTES % 2)).toInt()
+            val totalSegments = ((decodedBytes + segmentBytes - 1) / segmentBytes).toInt().coerceAtLeast(1)
+            val parts = mutableListOf<String>()
+
+            pcmFile.inputStream().buffered().use { input ->
+                var remaining = decodedBytes
+                var index = 0
+                while (remaining > 0) {
+                    val segLen = minOf(remaining, segmentBytes.toLong())
+                    val segFile = File(context.cacheDir, "gemini_seg_${System.currentTimeMillis()}.wav")
+                    try {
+                        writeWavSegment(input, segFile, segLen)
+
+                        _transcriptionState.value = State.Processing(
+                            "Gemini मा अपलोड गर्दैछ... (भाग ${index + 1}/$totalSegments)",
+                            parts.joinToString(" ")
+                        )
+                        val text = GeminiApiClient.transcribeViaFilesApi(
+                            config.apiKey, config.model, segFile.length(), "audio/wav",
+                            prompt, "nepali-audio-part-${index + 1}"
+                        ) { segFile.inputStream() }.getOrThrow()
+
+                        if (text.isNotBlank()) {
+                            parts.add(text.trim())
+                            _transcriptionState.value = State.Processing(
+                                "Gemini मा अपलोड गर्दैछ... (भाग ${index + 1}/$totalSegments)",
+                                parts.joinToString(" ")
+                            )
+                        }
+                    } finally {
+                        segFile.delete()
+                    }
+                    remaining -= segLen
+                    index++
+                }
+            }
+
+            if (parts.isEmpty()) {
+                throw IllegalStateException("Gemini ले ट्रान्सक्रिप्सन फर्काएन (Gemini returned no transcription)")
+            }
+            return parts.joinToString(" ")
+        } finally {
+            pcmFile.delete()
+        }
+    }
+
+    /** Copy [length] PCM bytes from [input] into a 16kHz mono 16-bit WAV file. */
+    private fun writeWavSegment(input: java.io.InputStream, segFile: File, length: Long) {
+        segFile.outputStream().buffered().use { out ->
+            out.write(AudioDecoder.buildWavHeader(length.toInt()))
+            val buffer = ByteArray(64 * 1024)
+            var copied = 0L
+            while (copied < length) {
+                val toRead = minOf(buffer.size.toLong(), length - copied).toInt()
+                val n = input.read(buffer, 0, toRead)
+                if (n < 0) break
+                out.write(buffer, 0, n)
+                copied += n
+            }
+        }
+    }
+
+    /** File size from the content resolver, or -1 if unknown. */
+    private fun queryFileSize(uri: Uri): Long {
+        try {
+            context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
+                if (afd.length >= 0) return afd.length
+            }
+        } catch (_: Exception) {}
+        try {
+            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val idx = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                if (idx >= 0 && cursor.moveToFirst() && !cursor.isNull(idx)) {
+                    return cursor.getLong(idx)
+                }
+            }
+        } catch (_: Exception) {}
+        return -1
+    }
+
+    /** Resolve an audio mime type Gemini accepts, or null if undeterminable. */
+    private fun resolveAudioMimeType(uri: Uri): String? {
+        val resolved = context.contentResolver.getType(uri)
+        if (resolved != null && resolved.startsWith("audio/")) return resolved
+
+        val name = uri.lastPathSegment?.lowercase() ?: return null
+        return when {
+            name.endsWith(".wav") -> "audio/wav"
+            name.endsWith(".mp3") -> "audio/mpeg"
+            name.endsWith(".m4a") || name.endsWith(".mp4") -> "audio/mp4"
+            name.endsWith(".aac") -> "audio/aac"
+            name.endsWith(".ogg") || name.endsWith(".oga") -> "audio/ogg"
+            name.endsWith(".opus") -> "audio/opus"
+            name.endsWith(".flac") -> "audio/flac"
+            name.endsWith(".aiff") || name.endsWith(".aif") -> "audio/aiff"
+            else -> null
         }
     }
 

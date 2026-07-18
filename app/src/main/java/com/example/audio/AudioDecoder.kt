@@ -596,7 +596,14 @@ object AudioDecoder {
      * Build a proper WAV container around raw PCM bytes for the model's audio backend.
      */
     fun wrapInWavHeader(pcmData: ByteArray): ByteArray {
-        val pcmDataSize = pcmData.size
+        return buildWavHeader(pcmData.size) + pcmData
+    }
+
+    /**
+     * Build a 44-byte WAV header for 16kHz mono 16-bit PCM of [pcmDataSize] bytes.
+     * Used when the PCM payload is streamed from disk rather than held in memory.
+     */
+    fun buildWavHeader(pcmDataSize: Int): ByteArray {
         val wavFileSize = pcmDataSize + 36 // total - 8 (RIFF header)
         val byteRate = TARGET_SAMPLE_RATE * TARGET_CHANNELS * (TARGET_BITS / 8)
         val blockAlign = TARGET_CHANNELS * (TARGET_BITS / 8)
@@ -620,6 +627,6 @@ object AudioDecoder {
             putInt(pcmDataSize)
         }.array()
 
-        return header + pcmData
+        return header
     }
 }

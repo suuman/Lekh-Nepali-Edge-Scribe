@@ -62,6 +62,15 @@ class MainViewModel(
     private val _isStrictTranscription = MutableStateFlow(true)
     val isStrictTranscription = _isStrictTranscription.asStateFlow()
 
+    private val _transcribeBackend = MutableStateFlow(TranscribeBackend.LOCAL)
+    val transcribeBackend = _transcribeBackend.asStateFlow()
+
+    private val _geminiApiKeyInput = MutableStateFlow("")
+    val geminiApiKeyInput = _geminiApiKeyInput.asStateFlow()
+
+    private val _geminiKeyState = MutableStateFlow<GeminiKeyState>(GeminiKeyState.Unvalidated)
+    val geminiKeyState = _geminiKeyState.asStateFlow()
+
     private val _realTimeText = MutableStateFlow("")
     val realTimeText = _realTimeText.asStateFlow()
 
@@ -77,6 +86,17 @@ class MainViewModel(
         started = SharingStarted.WhileSubscribed(5000),
         initialValue = emptyList()
     )
+
+    enum class TranscribeBackend { LOCAL, GEMINI }
+
+    sealed interface GeminiKeyState {
+        /** No validated key stored (key box empty or edited since last validation). */
+        object Unvalidated : GeminiKeyState
+        object Validating : GeminiKeyState
+        /** Key verified against the live API; [model] is the newest Gemini model it can use. */
+        data class Valid(val model: String) : GeminiKeyState
+        data class Invalid(val error: String) : GeminiKeyState
+    }
 
     sealed interface ModelState {
         object Unloaded : ModelState
@@ -103,6 +123,19 @@ class MainViewModel(
         val savedPath = prefs.getString("saved_model_path", null)
         if (!savedPath.isNullOrEmpty()) {
             loadModel(savedPath)
+        }
+
+        // Restore transcription backend + validated Gemini key
+        _transcribeBackend.value = if (prefs.getString("transcribe_backend", "local") == "gemini") {
+            TranscribeBackend.GEMINI
+        } else {
+            TranscribeBackend.LOCAL
+        }
+        val savedGeminiKey = prefs.getString("gemini_api_key", null)
+        val savedGeminiModel = prefs.getString("gemini_model", null)
+        if (!savedGeminiKey.isNullOrEmpty() && !savedGeminiModel.isNullOrEmpty()) {
+            _geminiApiKeyInput.value = savedGeminiKey
+            _geminiKeyState.value = GeminiKeyState.Valid(savedGeminiModel)
         }
         
         // Listen for successful transcription to save in local Room Database
@@ -436,9 +469,65 @@ class MainViewModel(
         }
     }
 
+    fun setTranscribeBackend(backend: TranscribeBackend) {
+        _transcribeBackend.value = backend
+        context.getSharedPreferences("nepalscribe_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putString("transcribe_backend", if (backend == TranscribeBackend.GEMINI) "gemini" else "local")
+            .apply()
+    }
+
+    /** Typing a new key invalidates the previous one — it must be re-validated before use. */
+    fun updateGeminiApiKeyInput(key: String) {
+        _geminiApiKeyInput.value = key
+        _geminiKeyState.value = GeminiKeyState.Unvalidated
+    }
+
+    /**
+     * Validate the entered key against the live Gemini API. On success the key and
+     * the newest available Gemini model are persisted, replacing any old key.
+     */
+    fun validateGeminiApiKey() {
+        val key = _geminiApiKeyInput.value.trim()
+        if (key.isEmpty()) {
+            _geminiKeyState.value = GeminiKeyState.Invalid("API key खाली छ (API key is empty)")
+            return
+        }
+        _geminiKeyState.value = GeminiKeyState.Validating
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = com.example.llm.GeminiApiClient.validateApiKey(key)
+            launch(Dispatchers.Main) {
+                result.fold(
+                    onSuccess = { model ->
+                        _geminiKeyState.value = GeminiKeyState.Valid(model)
+                        context.getSharedPreferences("nepalscribe_prefs", Context.MODE_PRIVATE)
+                            .edit()
+                            .putString("gemini_api_key", key)
+                            .putString("gemini_model", model)
+                            .apply()
+                    },
+                    onFailure = { e ->
+                        _geminiKeyState.value = GeminiKeyState.Invalid(
+                            e.localizedMessage ?: "API key प्रमाणीकरण असफल भयो (Validation failed)"
+                        )
+                    }
+                )
+            }
+        }
+    }
+
     fun transcribeFile() {
         val uri = _selectedAudioUri.value ?: return
-        transcribeEngine?.transcribeAudioFile(uri, _isStrictTranscription.value)
+        val geminiConfig = if (_transcribeBackend.value == TranscribeBackend.GEMINI) {
+            val keyState = _geminiKeyState.value
+            AudioTranscribeEngine.GeminiConfig(
+                apiKey = if (keyState is GeminiKeyState.Valid) _geminiApiKeyInput.value.trim() else "",
+                model = (keyState as? GeminiKeyState.Valid)?.model ?: ""
+            )
+        } else {
+            null
+        }
+        transcribeEngine?.transcribeAudioFile(uri, _isStrictTranscription.value, geminiConfig)
     }
 
     fun toggleStrictTranscription(enabled: Boolean) {
