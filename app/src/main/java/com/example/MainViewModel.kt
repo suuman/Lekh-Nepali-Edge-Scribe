@@ -16,7 +16,6 @@ import com.example.database.TranscriptionRepository
 import com.example.llm.LlmChatModelHelper
 import java.io.File
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
@@ -419,13 +418,18 @@ class MainViewModel(
     fun stopListeningAndSave() {
         transcribeEngine?.stopListening()
         viewModelScope.launch {
-            // Wait slightly for final results update
-            delay(500)
-            val currentState = transcribeState.value
-            if (currentState is AudioTranscribeEngine.State.Success) {
+            // Wait for the engine to finalize the session (final recognizer
+            // callback can arrive a few seconds after stop)
+            val finalState = kotlinx.coroutines.withTimeoutOrNull(6000L) {
+                transcribeState.first {
+                    it is AudioTranscribeEngine.State.Success && !it.fromFile ||
+                        it is AudioTranscribeEngine.State.Error
+                }
+            }
+            if (finalState is AudioTranscribeEngine.State.Success) {
                 saveTranscriptionToDatabase(
                     fileName = "Microphone Live Speech",
-                    text = currentState.text,
+                    text = finalState.text,
                     fromFile = false
                 )
             }

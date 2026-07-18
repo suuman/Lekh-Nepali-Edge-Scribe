@@ -18,6 +18,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
@@ -39,7 +40,11 @@ class AudioTranscribeEngine(
 
     sealed interface State {
         object Idle : State
-        data class Processing(val progressText: String? = null) : State
+        data class Processing(
+            val progressText: String? = null,
+            /** Transcription accumulated so far — shown live while later chunks process. */
+            val partialText: String = ""
+        ) : State
         data class Success(val text: String, val fromFile: Boolean) : State
         data class Error(val message: String) : State
     }
@@ -71,65 +76,120 @@ class AudioTranscribeEngine(
         }
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // Live microphone transcription (continuous)
+    //
+    // Android's SpeechRecognizer ends a session at the first pause, which is why
+    // a single startListening() only ever captured the opening words. We run it
+    // as a continuous session instead: each utterance is appended to a running
+    // transcript and the recognizer is restarted until the user presses stop.
+    // NO_MATCH / SPEECH_TIMEOUT during a session just mean "silence right now"
+    // and trigger a restart rather than an error.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private var continuousListening = false
+    private var accumulatedLiveText = ""
+    private var consecutiveFailedRestarts = 0
+    private var liveOnPartial: ((String) -> Unit)? = null
+    private var liveOnError: ((String) -> Unit)? = null
+
     fun startListening(onPartialResult: (String) -> Unit, onError: (String) -> Unit) {
         if (speechRecognizer == null) {
             onError("Speech recognition not available on this device.")
             return
         }
 
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ne-NP")
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ne-NP")
-            putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, "ne-NP")
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-        }
+        continuousListening = true
+        accumulatedLiveText = ""
+        consecutiveFailedRestarts = 0
+        liveOnPartial = onPartialResult
+        liveOnError = onError
+        _isRecording.value = true
+        _transcriptionState.value = State.Processing()
 
-        speechRecognizer?.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {}
-            override fun onBeginningOfSpeech() {
-                _isRecording.value = true
-                _transcriptionState.value = State.Processing()
+        startListeningSession()
+    }
+
+    private fun buildLiveRecognizerIntent() = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ne-NP")
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ne-NP")
+        putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, "ne-NP")
+        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+        // Tolerate longer pauses before the recognizer closes the utterance
+        // (hints only — some recognizer implementations ignore them)
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 4000L)
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 4000L)
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 15000L)
+    }
+
+    private fun startListeningSession() {
+        val recognizer = speechRecognizer ?: return
+
+        recognizer.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {
+                consecutiveFailedRestarts = 0
             }
+            override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
             override fun onEndOfSpeech() {
-                _isRecording.value = false
+                // Keep _isRecording true: the utterance ended, the session hasn't
             }
+
             override fun onError(error: Int) {
-                _isRecording.value = false
-                val errorMsg = when (error) {
-                    SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
-                    SpeechRecognizer.ERROR_CLIENT -> "Client error"
-                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Insufficient permissions"
-                    SpeechRecognizer.ERROR_NETWORK -> "Network error"
-                    SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timeout"
-                    SpeechRecognizer.ERROR_NO_MATCH -> "No match pattern found"
-                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Speech recognizer busy"
-                    SpeechRecognizer.ERROR_SERVER -> "Server error"
-                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech input timeout"
-                    else -> "Unknown error: $error"
+                if (!continuousListening) {
+                    // User already pressed stop — whatever we accumulated is the result
+                    finishLiveSession(null)
+                    return
                 }
-                _transcriptionState.value = State.Error(errorMsg)
-                onError(errorMsg)
+                when (error) {
+                    SpeechRecognizer.ERROR_NO_MATCH,
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
+                        // Just silence — keep the session alive
+                        restartListeningSession()
+                    }
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
+                    SpeechRecognizer.ERROR_CLIENT -> {
+                        consecutiveFailedRestarts++
+                        if (consecutiveFailedRestarts <= 3) {
+                            restartListeningSession()
+                        } else {
+                            finishLiveSession("Speech recognizer stopped responding")
+                        }
+                    }
+                    else -> {
+                        val errorMsg = when (error) {
+                            SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
+                            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Insufficient permissions"
+                            SpeechRecognizer.ERROR_NETWORK -> "Network error"
+                            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timeout"
+                            SpeechRecognizer.ERROR_SERVER -> "Server error"
+                            else -> "Recognition error: $error"
+                        }
+                        finishLiveSession(errorMsg)
+                    }
+                }
             }
 
             override fun onResults(results: Bundle?) {
-                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                if (!matches.isNullOrEmpty()) {
-                    val text = matches[0]
-                    _transcriptionState.value = State.Success(text, fromFile = false)
-                    onPartialResult(text)
+                val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                if (!text.isNullOrBlank()) {
+                    accumulatedLiveText = if (accumulatedLiveText.isEmpty()) text
+                        else "$accumulatedLiveText $text"
+                    liveOnPartial?.invoke(accumulatedLiveText)
+                }
+                if (continuousListening) {
+                    restartListeningSession()
                 } else {
-                    _transcriptionState.value = State.Error("No match found")
-                    onError("No transcription matched.")
+                    finishLiveSession(null)
                 }
             }
 
             override fun onPartialResults(partialResults: Bundle?) {
-                val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                if (!matches.isNullOrEmpty()) {
-                    onPartialResult(matches[0])
+                val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                if (!partial.isNullOrBlank()) {
+                    liveOnPartial?.invoke("$accumulatedLiveText $partial".trim())
                 }
             }
 
@@ -137,22 +197,57 @@ class AudioTranscribeEngine(
         })
 
         try {
-            speechRecognizer?.startListening(intent)
+            recognizer.startListening(buildLiveRecognizerIntent())
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to start speech recognizer: ${e.localizedMessage}", e)
-            _isRecording.value = false
-            _transcriptionState.value = State.Error(e.localizedMessage ?: "Failed to start speech recognition")
-            onError(e.localizedMessage ?: "Failed to start speech recognition")
+            finishLiveSession(e.localizedMessage ?: "Failed to start speech recognition")
+        }
+    }
+
+    /** Restart the recognizer for the next utterance of a continuous session. */
+    private fun restartListeningSession() {
+        scope.launch {
+            try { speechRecognizer?.cancel() } catch (_: Exception) {}
+            delay(150)
+            if (continuousListening) {
+                startListeningSession()
+            }
+        }
+    }
+
+    /** Finalize a live session: deliver accumulated text as Success, or an error. */
+    private fun finishLiveSession(errorMessage: String?) {
+        continuousListening = false
+        _isRecording.value = false
+        val text = accumulatedLiveText.trim()
+        when {
+            text.isNotEmpty() -> _transcriptionState.value = State.Success(text, fromFile = false)
+            errorMessage != null -> {
+                _transcriptionState.value = State.Error(errorMessage)
+                liveOnError?.invoke(errorMessage)
+            }
+            else -> {
+                val msg = "कुनै बोली भेटिएन (No speech detected)"
+                _transcriptionState.value = State.Error(msg)
+                liveOnError?.invoke(msg)
+            }
         }
     }
 
     fun stopListening() {
+        continuousListening = false
         try {
             speechRecognizer?.stopListening()
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to stop speech recognizer: ${e.localizedMessage}", e)
-        } finally {
-            _isRecording.value = false
+        }
+        // The final onResults/onError callback finalizes the session; if the
+        // recognizer never calls back, finalize with what we have
+        scope.launch {
+            delay(3000)
+            if (_isRecording.value) {
+                finishLiveSession(null)
+            }
         }
     }
 
@@ -286,7 +381,8 @@ class AudioTranscribeEngine(
         forEachPcmChunk(pcmFile) { chunk, index, total ->
             Log.i(TAG, "Native inference chunk ${index + 1}/$total (${chunk.size} bytes)")
             _transcriptionState.value = State.Processing(
-                "स्थानीय एआईले फाईल प्रशोधन गर्दैछ... (भाग ${index + 1}/$total)"
+                "स्थानीय एआईले फाईल प्रशोधन गर्दैछ... (भाग ${index + 1}/$total)",
+                transcriptionParts.joinToString(" ")
             )
 
             // Fresh conversation per chunk: clears prior audio/text tokens so each
@@ -310,6 +406,12 @@ class AudioTranscribeEngine(
             val cleanResult = result.trim()
             if (cleanResult.isNotEmpty()) {
                 transcriptionParts.add(cleanResult)
+                // Publish the chunk's text immediately so the user sees the
+                // transcript grow while later chunks are still processing
+                _transcriptionState.value = State.Processing(
+                    "स्थानीय एआईले फाईल प्रशोधन गर्दैछ... (भाग ${index + 1}/$total)",
+                    transcriptionParts.joinToString(" ")
+                )
             }
             true
         }
@@ -353,12 +455,17 @@ class AudioTranscribeEngine(
         forEachPcmChunk(pcmFile) { chunk, index, total ->
             Log.i(TAG, "Playback transcription chunk ${index + 1}/$total (${chunk.size} bytes)")
             _transcriptionState.value = State.Processing(
-                "स्थानीय एआईले फाईल प्रशोधन गर्दैछ... (भाग ${index + 1}/$total)"
+                "स्थानीय एआईले फाईल प्रशोधन गर्दैछ... (भाग ${index + 1}/$total)",
+                transcriptionParts.joinToString(" ")
             )
 
             val partialText = recognizePcmChunk(chunk)
             if (!partialText.isNullOrBlank()) {
                 transcriptionParts.add(partialText)
+                _transcriptionState.value = State.Processing(
+                    "स्थानीय एआईले फाईल प्रशोधन गर्दैछ... (भाग ${index + 1}/$total)",
+                    transcriptionParts.joinToString(" ")
+                )
             }
             true
         }

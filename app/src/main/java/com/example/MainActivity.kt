@@ -397,14 +397,15 @@ fun TranscriberScreen(
                                     style = MaterialTheme.typography.bodyMedium,
                                     textAlign = TextAlign.Center
                                 )
-                                if (realTimeText.isNotEmpty()) {
+                                val liveTranscript = if (isRecording) realTimeText else state.partialText
+                                if (liveTranscript.isNotEmpty()) {
                                     Surface(
                                         color = MaterialTheme.colorScheme.surfaceVariant,
                                         shape = RoundedCornerShape(8.dp),
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
                                         Text(
-                                            text = realTimeText,
+                                            text = liveTranscript,
                                             modifier = Modifier.padding(12.dp),
                                             style = MaterialTheme.typography.bodyMedium,
                                             fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
